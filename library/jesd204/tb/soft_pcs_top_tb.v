@@ -35,7 +35,7 @@ module soft_pcs_top_tb;
   // Unaligned pipeline for bitshift simulation
   wire [NUM_LANES*DATA_PATH_WIDTH*10+9:0] phy_tx_data_full[0:NUM_LANES-1];
   reg [8:0] phy_tx_data_d1[0:NUM_LANES-1];
-  reg [3:0] bitshift = 4'h0;
+  reg [3:0] bitshift = 4'h3; // Non-zero bitshift to test pattern alignment
 
   genvar l;
   generate
@@ -47,7 +47,7 @@ module soft_pcs_top_tb;
       assign phy_tx_data_full[l] = {phy_tx_data[l*DATA_PATH_WIDTH*10+:DATA_PATH_WIDTH*10], phy_tx_data_d1[l]};
 
       always @(*) begin
-        phy_rx_data[l*DATA_PATH_WIDTH*10+:DATA_PATH_WIDTH*10] <= phy_tx_data_full[l][bitshift+:DATA_PATH_WIDTH*10];
+        phy_rx_data[l*DATA_PATH_WIDTH*10+:DATA_PATH_WIDTH*10] = phy_tx_data_full[l][bitshift+:DATA_PATH_WIDTH*10];
       end
     end
   endgenerate

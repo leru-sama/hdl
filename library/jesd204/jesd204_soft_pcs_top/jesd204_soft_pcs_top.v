@@ -101,8 +101,8 @@ module jesd204_soft_pcs_top #(
       rx_charisk <= rx_charisk_s;
       rx_notintable <= rx_notintable_s;
       rx_disperr <= rx_disperr_s;
-      // Mark valid when decoded character is valid (no decoder errors and upper layer ready)
-      rx_valid <= (rx_notintable_s == 'b0) && (rx_disperr_s == 'b0);
+      // Valid when no decoder errors and pattern alignment phase is completed
+      rx_valid <= (rx_notintable_s == 'b0) && (rx_disperr_s == 'b0) && (!rx_pattern_align_en);
     end
   end
 
