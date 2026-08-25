@@ -1,6 +1,23 @@
 // ***************************************************************************
-// JESD204 PCS Link Training Testbench
-// 2 DUTs: TX device <-> RX device with per-lane random skew
+// JESD204 PCS Link Training Testbench - 2 DUTs point-to-point
+//
+// Two independent jesd204_pcs_link_training instances:
+//   * tx_device  : application -> serdes  (drives the line)
+//   * rx_device  : serdes -> application  (recovers the link)
+//
+// The two are connected only through a 4-lane "serdes" model that injects a
+// random per-lane skew (0..MAX_SKEW parallel-clock cycles).  The RX parallel
+// clock is frequency-locked to the TX (as a real CDR-recovered clock would be)
+// but phase-shifted, so the elastic buffers must absorb both the phase offset
+// and the inter-lane skew.
+//
+// Data integrity is checked with a latency-tolerant scoreboard:
+//   * TX transmits a fixed marker PREAMBLE followed by a per-lane distinct
+//     incrementing payload, one beat per parallel clock while in DATA.
+//   * RX collects every valid application beat into a stream.
+//   * After the run we locate the PREAMBLE in the RX stream and verify the
+//     payload that follows - for every lane and every octet - proving both
+//     data integrity and correct lane de-skew/alignment.
 // ***************************************************************************
 `timescale 1ns/100ps
 
@@ -11,6 +28,38 @@ module jesd204_pcs_link_training_tb;
   parameter DATA_PATH_WIDTH = 2;
   parameter CLK_PERIOD = 10;
   parameter MAX_SKEW = 16;
+  parameter SEED = 1;      // skew RNG seed (override to sweep skew patterns)
+
+  parameter PREAMBLE_LEN = 4;     // marker beats
+  parameter PAYLOAD_LEN  = 256;   // payload beats
+
+  localparam DW = DATA_PATH_WIDTH*8*NUM_LANES;   // 64
+  localparam CW = DATA_PATH_WIDTH*NUM_LANES;     // 8
+
+  // Distinct non-zero marker bytes - will not appear in idle (0x00) nor in the
+  // low-valued incrementing payload prefix, so the anchor is unambiguous.
+  function [7:0] preamble_byte;
+    input integer idx;
+    begin
+      case (idx)
+        0: preamble_byte = 8'hF0;
+        1: preamble_byte = 8'hE1;
+        2: preamble_byte = 8'hD2;
+        3: preamble_byte = 8'hC3;
+        default: preamble_byte = 8'hAA;
+      endcase
+    end
+  endfunction
+
+  // Per-lane, per-octet payload byte for payload index p (0-based).
+  function [7:0] payload_byte;
+    input integer p;
+    input integer lane;
+    input integer octet;   // 0 or 1 within the beat
+    begin
+      payload_byte = (p + lane*17 + octet*128) & 8'hFF;
+    end
+  endfunction
 
   // ---------------------------------------------------------------
   // TX Device signals
@@ -29,8 +78,8 @@ module jesd204_pcs_link_training_tb;
 
   reg tx_app_valid;
   wire tx_app_ready;
-  reg [DATA_PATH_WIDTH*8*NUM_LANES-1:0] tx_app_data;
-  reg [DATA_PATH_WIDTH*NUM_LANES-1:0] tx_app_charisk;
+  reg [DW-1:0] tx_app_data;
+  reg [CW-1:0] tx_app_charisk;
 
   wire [DATA_PATH_WIDTH*10*NUM_LANES-1:0] tx_serdes_data;
   wire [1:0] tx_status_state;
@@ -53,59 +102,65 @@ module jesd204_pcs_link_training_tb;
 
   wire rx_app_valid;
   reg rx_app_ready;
-  wire [DATA_PATH_WIDTH*8*NUM_LANES-1:0] rx_app_data;
-  wire [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_app_charisk;
-  wire [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_app_notintable;
-  wire [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_app_disperr;
+  wire [DW-1:0] rx_app_data;
+  wire [CW-1:0] rx_app_charisk;
+  wire [CW-1:0] rx_app_notintable;
+  wire [CW-1:0] rx_app_disperr;
 
-  wire [DATA_PATH_WIDTH*10*NUM_LANES-1:0] rx_serdes_data;
+  reg  [DATA_PATH_WIDTH*10*NUM_LANES-1:0] rx_serdes_data;
   wire [1:0] rx_status_state;
   wire [NUM_LINKS-1:0] rx_sync_n;
   wire [NUM_LANES-1:0] rx_ilas_config_valid;
 
   // ---------------------------------------------------------------
-  // Serdes with per-lane random skew
+  // Serdes model: per-lane random skew (0..MAX_SKEW parallel cycles)
   // ---------------------------------------------------------------
-  reg [19:0] lane0_pipe [0:MAX_SKEW];
-  reg [19:0] lane1_pipe [0:MAX_SKEW];
-  reg [19:0] lane2_pipe [0:MAX_SKEW];
-  reg [19:0] lane3_pipe [0:MAX_SKEW];
+  reg [19:0] lane_pipe [0:NUM_LANES-1][0:MAX_SKEW];
   integer lane_delay [0:NUM_LANES-1];
-  integer i;
+  integer i;           // init-only
+  integer sh_i, sh_s;  // serdes shift always
+  integer cm_i;        // combinational skew mux
+  integer ts;          // main transmit loop
 
+  integer seed;
   initial begin
+    seed = SEED;
     for (i = 0; i < NUM_LANES; i = i + 1) begin
-      lane_delay[i] = $urandom_range(0, MAX_SKEW);
-      $display("Lane %0d delay: %0d cycles", i, lane_delay[i]);
+      lane_delay[i] = {$random(seed)} % (MAX_SKEW + 1);
+      $display("Lane %0d skew: %0d cycles", i, lane_delay[i]);
     end
   end
 
+  // The skew shift-registers are clocked by the RX parallel clock.  Because the
+  // RX clock is frequency-locked to the TX clock this faithfully models a CDR-
+  // recovered parallel bus (same rate, arbitrary phase + per-lane skew).
   always @(posedge rx_clk) begin
-    lane0_pipe[0] <= tx_serdes_data[19:0];
-    lane1_pipe[0] <= tx_serdes_data[39:20];
-    lane2_pipe[0] <= tx_serdes_data[59:40];
-    lane3_pipe[0] <= tx_serdes_data[79:60];
-    for (i = 1; i <= MAX_SKEW; i = i + 1) begin
-      lane0_pipe[i] <= lane0_pipe[i-1];
-      lane1_pipe[i] <= lane1_pipe[i-1];
-      lane2_pipe[i] <= lane2_pipe[i-1];
-      lane3_pipe[i] <= lane3_pipe[i-1];
+    for (sh_i = 0; sh_i < NUM_LANES; sh_i = sh_i + 1) begin
+      lane_pipe[sh_i][0] <= tx_serdes_data[sh_i*20 +: 20];
+      for (sh_s = 1; sh_s <= MAX_SKEW; sh_s = sh_s + 1)
+        lane_pipe[sh_i][sh_s] <= lane_pipe[sh_i][sh_s-1];
     end
   end
 
-  assign rx_serdes_data[19:0]  = lane0_pipe[lane_delay[0]];
-  assign rx_serdes_data[39:20] = lane1_pipe[lane_delay[1]];
-  assign rx_serdes_data[59:40] = lane2_pipe[lane_delay[2]];
-  assign rx_serdes_data[79:60] = lane3_pipe[lane_delay[3]];
+  // Apply the per-lane skew (variable index into the shift-register array).
+  always @(*) begin
+    for (cm_i = 0; cm_i < NUM_LANES; cm_i = cm_i + 1)
+      rx_serdes_data[cm_i*20 +: 20] = lane_pipe[cm_i][lane_delay[cm_i]];
+  end
 
   // ---------------------------------------------------------------
-  // Clock generation (independent clocks)
+  // Clocks: RX is frequency-locked to TX but phase-shifted (mesochronous).
+  // A parallel serdes RX runs on the CDR-recovered clock: same rate, arbitrary
+  // phase.  (Different *frequencies* would under/oversample and drop symbols.)
   // ---------------------------------------------------------------
   initial tx_clk = 0;
   always #(CLK_PERIOD/2) tx_clk = ~tx_clk;
 
-  initial rx_clk = 0;
-  always #(CLK_PERIOD/2 + 1) rx_clk = ~rx_clk;
+  initial begin
+    rx_clk = 0;
+    #3;                       // static phase offset vs tx_clk
+    forever #(CLK_PERIOD/2) rx_clk = ~rx_clk;
+  end
 
   // ---------------------------------------------------------------
   // TX Device (DUT 1) - receives sync_request_n from RX device
@@ -141,7 +196,7 @@ module jesd204_pcs_link_training_tb;
     .rx_notintable(),
     .rx_disperr(),
     .serdes_tx_data(tx_serdes_data),
-    .serdes_rx_data({NUM_LANES{20'b0}}),
+    .serdes_rx_data({(DATA_PATH_WIDTH*10*NUM_LANES){1'b0}}),
     .sync_request_n(rx_sync_n),  // RX device sync_n drives TX device
     .status_ctrl_state(tx_status_state),
     .status_lane_cgs_state(),
@@ -178,8 +233,8 @@ module jesd204_pcs_link_training_tb;
     .cfg_continuous_ilas(rx_cfg_continuous_ilas),
     .tx_valid(1'b0),
     .tx_ready(),
-    .tx_data({NUM_LANES{16'b0}}),
-    .tx_charisk({NUM_LANES{2'b0}}),
+    .tx_data({DW{1'b0}}),
+    .tx_charisk({CW{1'b0}}),
     .rx_valid(rx_app_valid),
     .rx_ready(rx_app_ready),
     .rx_data(rx_app_data),
@@ -188,7 +243,7 @@ module jesd204_pcs_link_training_tb;
     .rx_disperr(rx_app_disperr),
     .serdes_tx_data(),
     .serdes_rx_data(rx_serdes_data),
-    .sync_request_n({NUM_LINKS{1'b1}}),  // No sync request from TX side
+    .sync_request_n({NUM_LINKS{1'b1}}),  // no remote request into RX device
     .status_ctrl_state(rx_status_state),
     .status_lane_cgs_state(),
     .status_lane_ifs_ready(),
@@ -200,141 +255,236 @@ module jesd204_pcs_link_training_tb;
     .event_frame_alignment_error());
 
   // ---------------------------------------------------------------
-  // Test control
+  // Common configuration
   // ---------------------------------------------------------------
-  integer tx_count, rx_count;
-  reg [7:0] expected_data [0:99];
-  integer match_count, mismatch_count;
+  task apply_cfg;
+    begin
+      tx_cfg_octets_per_multiframe = 10'd32;
+      tx_cfg_octets_per_frame = 8'd4;
+      tx_cfg_lanes_disable = {NUM_LANES{1'b0}};
+      tx_cfg_links_disable = {NUM_LINKS{1'b0}};
+      tx_cfg_disable_scrambler = 1'b1;
+      tx_cfg_disable_char_replacement = 1'b1;
+      tx_cfg_mframes_per_ilas = 8'd4;
+      tx_cfg_skip_ilas = 1'b0;
+      tx_cfg_continuous_cgs = 1'b0;
+      tx_cfg_continuous_ilas = 1'b0;
+
+      rx_cfg_octets_per_multiframe = 10'd32;
+      rx_cfg_octets_per_frame = 8'd4;
+      rx_cfg_lanes_disable = {NUM_LANES{1'b0}};
+      rx_cfg_links_disable = {NUM_LINKS{1'b0}};
+      rx_cfg_disable_scrambler = 1'b1;
+      rx_cfg_disable_char_replacement = 1'b1;
+      rx_cfg_mframes_per_ilas = 8'd4;
+      rx_cfg_skip_ilas = 1'b0;
+      rx_cfg_continuous_cgs = 1'b0;
+      rx_cfg_continuous_ilas = 1'b0;
+    end
+  endtask
 
   // ---------------------------------------------------------------
-  // Test sequence
+  // Reference (TX side) and captured (RX side) streams
+  // ---------------------------------------------------------------
+  localparam TOTAL = PREAMBLE_LEN + PAYLOAD_LEN;
+
+  // reference: for each transmitted DATA beat, the full DW-wide word
+  reg [DW-1:0] tx_ref [0:TOTAL-1];
+  integer tx_beats;             // number of DATA beats transmitted
+
+  // capture: every valid RX application beat
+  localparam CAP_MAX = 2048;
+  reg [DW-1:0] rx_cap [0:CAP_MAX-1];
+  integer rx_beats;
+
+  integer match_count, mismatch_count, anchor;
+
+  // Build the DW-wide word transmitted on beat number `bn` (0-based over the
+  // whole TOTAL sequence: first PREAMBLE_LEN beats are markers, then payload).
+  function [DW-1:0] gen_word;
+    input integer bn;
+    integer l, p;
+    reg [DW-1:0] w;
+    begin
+      w = {DW{1'b0}};
+      if (bn < PREAMBLE_LEN) begin
+        for (l = 0; l < NUM_LANES; l = l + 1) begin
+          // both octets of every lane carry the same marker byte
+          w[(l*DATA_PATH_WIDTH+0)*8 +: 8] = preamble_byte(bn);
+          w[(l*DATA_PATH_WIDTH+1)*8 +: 8] = preamble_byte(bn);
+        end
+      end else begin
+        p = bn - PREAMBLE_LEN;
+        for (l = 0; l < NUM_LANES; l = l + 1) begin
+          w[(l*DATA_PATH_WIDTH+0)*8 +: 8] = payload_byte(p, l, 0);
+          w[(l*DATA_PATH_WIDTH+1)*8 +: 8] = payload_byte(p, l, 1);
+        end
+      end
+      gen_word = w;
+    end
+  endfunction
+
+  // ---------------------------------------------------------------
+  // Main stimulus
   // ---------------------------------------------------------------
   initial begin
     tx_reset = 1;
     rx_reset = 1;
-    tx_cfg_octets_per_multiframe = 10'd64;
-    tx_cfg_octets_per_frame = 8'd4;
-    tx_cfg_lanes_disable = 4'b0000;
-    tx_cfg_links_disable = 1'b0;
-    tx_cfg_disable_scrambler = 1'b1;
-    tx_cfg_disable_char_replacement = 1'b1;
-    tx_cfg_mframes_per_ilas = 8'd4;
-    tx_cfg_skip_ilas = 1'b0;
-    tx_cfg_continuous_cgs = 1'b0;
-    tx_cfg_continuous_ilas = 1'b0;
-
-    rx_cfg_octets_per_multiframe = 10'd64;
-    rx_cfg_octets_per_frame = 8'd4;
-    rx_cfg_lanes_disable = 4'b0000;
-    rx_cfg_links_disable = 1'b0;
-    rx_cfg_disable_scrambler = 1'b1;
-    rx_cfg_disable_char_replacement = 1'b1;
-    rx_cfg_mframes_per_ilas = 8'd4;
-    rx_cfg_skip_ilas = 1'b0;
-    rx_cfg_continuous_cgs = 1'b0;
-    rx_cfg_continuous_ilas = 1'b0;
+    apply_cfg;
 
     tx_app_valid = 1'b0;
-    tx_app_data = 64'b0;
-    tx_app_charisk = 8'b0;
+    tx_app_data  = {DW{1'b0}};
+    tx_app_charisk = {CW{1'b0}};
     rx_app_ready = 1'b1;
-    tx_count = 0;
-    rx_count = 0;
+    tx_beats = 0;
+    rx_beats = 0;
     match_count = 0;
     mismatch_count = 0;
-
-    for (i = 0; i < 100; i = i + 1)
-      expected_data[i] = i[7:0];
+    anchor = -1;
 
     repeat(20) @(posedge tx_clk);
     tx_reset = 0;
     rx_reset = 0;
     repeat(20) @(posedge tx_clk);
 
-    $display("[%0t] Starting 2-DUT test (4 lanes, max skew %0d cycles)...", $time, MAX_SKEW);
+    $display("[%0t] Starting 2-DUT test (%0d lanes, max skew %0d cycles)...",
+             $time, NUM_LANES, MAX_SKEW);
 
+    // Wait for link training to complete on both sides.
     wait(tx_status_state == 2'b11);
-    $display("[%0t] TX device entered DATA state", $time);
-
-    // Wait for RX to complete lane alignment
+    $display("[%0t] TX device reached DATA state", $time);
     wait(rx_app_valid == 1'b1);
-    $display("[%0t] RX buffer released - lane alignment complete!", $time);
+    $display("[%0t] RX de-skew complete, application data valid", $time);
 
-    repeat(50) @(posedge tx_clk);
+    // Let the data phase settle a few multiframes before injecting payload.
+    repeat(40) @(posedge tx_clk);
 
-    $display("[%0t] Sending data from TX to RX...", $time);
+    $display("[%0t] Transmitting %0d marker + %0d payload beats...",
+             $time, PREAMBLE_LEN, PAYLOAD_LEN);
 
-    // Debug: check serdes signals
-    $display("[%0t] TX serdes[19:0]=%020b", $time, tx_serdes_data[19:0]);
-    $display("[%0t] RX serdes[19:0]=%020b", $time, rx_serdes_data[19:0]);
-    $display("[%0t] TX phy_data[15:0]=%016h", $time, tx_device.tx_phy_data[15:0]);
-    $display("[%0t] RX phy_data[15:0]=%016h", $time, rx_device.rx_phy_data[15:0]);
+    // In the DATA phase the TX line carries one application beat every parallel
+    // clock, so we drive a fresh word every cycle and record it as reference.
+    for (ts = 0; ts < TOTAL; ts = ts + 1) begin
+      @(posedge tx_clk);
+      tx_app_valid <= 1'b1;
+      tx_app_charisk <= {CW{1'b0}};
+      tx_app_data <= gen_word(ts);
+      tx_ref[ts] = gen_word(ts);
+      tx_beats = tx_beats + 1;
+    end
+    @(posedge tx_clk);
+    tx_app_valid <= 1'b0;
+    tx_app_data  <= {DW{1'b0}};
 
-    fork
-      begin : tx_send
-        integer k;
-        for (k = 0; k < 100; k = k + 1) begin
-          @(posedge tx_clk);
-          if (tx_app_ready) begin
-            tx_app_valid <= 1'b1;
-            tx_app_data <= {4{expected_data[k], expected_data[k]}};
-            tx_app_charisk <= 8'b0;
-            tx_count <= tx_count + 1;
-          end else begin
-            tx_app_valid <= 1'b0;
-          end
-        end
-        tx_app_valid <= 1'b0;
-      end
+    // Allow the whole payload to drain through skew + elastic buffers.  The RX
+    // trails the TX by the elastic-buffer fill latency (idle beats accumulated
+    // before payload injection), so wait long enough to flush all TOTAL beats.
+    repeat(400) @(posedge tx_clk);
 
-      begin : rx_check
-        integer k;
-        reg [7:0] rx_byte;
-        for (k = 0; k < 100; k = k + 1) begin
-          @(posedge rx_clk);
-          if (rx_app_valid && rx_app_ready) begin
-            rx_byte = rx_app_data[7:0];
-            if (k < 10)
-              $display("[%0t] RX[%0d]: got=%02h exp=%02h data=%08h", $time, k, rx_byte, expected_data[k], rx_app_data[31:0]);
-            if (rx_byte == expected_data[k])
-              match_count = match_count + 1;
-            else begin
-              mismatch_count = mismatch_count + 1;
-            end
-            rx_count = rx_count + 1;
-          end
-        end
-      end
-    join
-
-    repeat(200) @(posedge tx_clk);
+    // ---------------------------------------------------------------
+    // Scoreboard: anchor on the preamble, then verify the payload.
+    // ---------------------------------------------------------------
+    verify_stream;
 
     $display("========================================");
     $display("2-DUT Test Results:");
-    $display("  Lane delays: %0d, %0d, %0d, %0d", lane_delay[0], lane_delay[1], lane_delay[2], lane_delay[3]);
-    $display("  TX sent:     %0d", tx_count);
-    $display("  RX received: %0d", rx_count);
+    $display("  Lane skews:  %0d, %0d, %0d, %0d",
+             lane_delay[0], lane_delay[1], lane_delay[2], lane_delay[3]);
+    $display("  TX beats:    %0d", tx_beats);
+    $display("  RX beats:    %0d", rx_beats);
+    $display("  Anchor idx:  %0d", anchor);
     $display("  Matches:     %0d", match_count);
     $display("  Mismatches:  %0d", mismatch_count);
-    $display("  TX state: %0b, RX state: %0b", tx_status_state, rx_status_state);
+    $display("  TX state:    %0b", tx_status_state);
     $display("========================================");
 
-    if (tx_status_state == 2'b11 && rx_status_state == 2'b11 &&
-        rx_app_valid && tx_count > 0 && mismatch_count == 0)
-      $display("SUCCESS: 2-DUT link training and data transfer completed");
+    if (tx_status_state == 2'b11 && anchor >= 0 &&
+        match_count == PAYLOAD_LEN && mismatch_count == 0)
+      $display("SUCCESS: 2-DUT link training + data transfer verified across %0d lanes",
+               NUM_LANES);
     else
       $display("FAILED");
 
     $finish;
   end
 
+  // ---------------------------------------------------------------
+  // RX capture: record every valid application beat
+  // ---------------------------------------------------------------
+  always @(posedge rx_clk) begin
+    if (!rx_reset && rx_app_valid && rx_app_ready && rx_beats < CAP_MAX) begin
+      rx_cap[rx_beats] <= rx_app_data;
+      rx_beats <= rx_beats + 1;
+    end
+  end
+
+  // ---------------------------------------------------------------
+  // Find the preamble in the capture, then compare the payload beat-by-beat
+  // across every lane and octet.
+  // ---------------------------------------------------------------
+  task verify_stream;
+    integer idx, k, l, oct, ok;
+    reg [7:0] got, exp;
+    begin
+      // locate anchor: first index where PREAMBLE_LEN consecutive beats match
+      // the marker words on all lanes/octets.
+      anchor = -1;
+      for (idx = 0; idx + PREAMBLE_LEN <= rx_beats && anchor < 0; idx = idx + 1) begin
+        ok = 1;
+        for (k = 0; k < PREAMBLE_LEN && ok; k = k + 1)
+          if (rx_cap[idx+k] !== tx_ref[k]) ok = 0;
+        if (ok) anchor = idx;
+      end
+
+      if (anchor < 0) begin
+        $display("[%0t] ERROR: preamble not found in RX capture (%0d beats)",
+                 $time, rx_beats);
+        disable verify_stream;
+      end
+
+      if (anchor + TOTAL > rx_beats) begin
+        $display("[%0t] ERROR: incomplete capture: anchor=%0d TOTAL=%0d beats=%0d",
+                 $time, anchor, TOTAL, rx_beats);
+        disable verify_stream;
+      end
+
+      $display("[%0t] Preamble anchored at RX beat %0d", $time, anchor);
+
+      // verify the payload region
+      for (k = 0; k < PAYLOAD_LEN; k = k + 1) begin
+        ok = 1;
+        for (l = 0; l < NUM_LANES; l = l + 1) begin
+          for (oct = 0; oct < DATA_PATH_WIDTH; oct = oct + 1) begin
+            got = rx_cap[anchor+PREAMBLE_LEN+k][(l*DATA_PATH_WIDTH+oct)*8 +: 8];
+            exp = payload_byte(k, l, oct);
+            if (got !== exp) begin
+              ok = 0;
+              if (mismatch_count < 10)
+                $display("[%0t] MISMATCH beat %0d lane %0d oct %0d: got=%02h exp=%02h",
+                         $time, k, l, oct, got, exp);
+            end
+          end
+        end
+        if (ok) match_count = match_count + 1;
+        else    mismatch_count = mismatch_count + 1;
+      end
+    end
+  endtask
+
+  // ---------------------------------------------------------------
+  // Timeout
+  // ---------------------------------------------------------------
   initial begin
     #3000000;
-    $display("TIMEOUT: tx_state=%0b rx_state=%0b", tx_status_state, rx_status_state);
+    $display("TIMEOUT: tx_state=%0b rx_valid=%0b rx_beats=%0d",
+             tx_status_state, rx_app_valid, rx_beats);
     $finish;
   end
 
-  reg [1:0] tx_prev_state, rx_prev_state;
+  // ---------------------------------------------------------------
+  // State tracing
+  // ---------------------------------------------------------------
+  reg [1:0] tx_prev_state;
   always @(posedge tx_clk) begin
     if (!tx_reset && tx_status_state !== tx_prev_state) begin
       case (tx_status_state)
@@ -344,28 +494,6 @@ module jesd204_pcs_link_training_tb;
         2'b11: $display("[%0t] TX: DATA", $time);
       endcase
       tx_prev_state <= tx_status_state;
-    end
-  end
-  always @(posedge rx_clk) begin
-    if (!rx_reset && rx_status_state !== rx_prev_state) begin
-      case (rx_status_state)
-        2'b00: $display("[%0t] RX: RESET", $time);
-        2'b01: $display("[%0t] RX: CGS", $time);
-        2'b10: $display("[%0t] RX: ILAS", $time);
-        2'b11: $display("[%0t] RX: DATA", $time);
-      endcase
-      rx_prev_state <= rx_status_state;
-    end
-  end
-  always @(posedge rx_clk) begin
-    if (!rx_reset && rx_status_state !== rx_prev_state) begin
-      case (rx_status_state)
-        2'b00: $display("[%0t] RX: RESET", $time);
-        2'b01: $display("[%0t] RX: CGS", $time);
-        2'b10: $display("[%0t] RX: ILAS", $time);
-        2'b11: $display("[%0t] RX: DATA", $time);
-      endcase
-      rx_prev_state <= rx_status_state;
     end
   end
 

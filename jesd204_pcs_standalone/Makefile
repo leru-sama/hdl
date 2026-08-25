@@ -87,6 +87,23 @@ test_simple:
 .PHONY: test_link_training
 test_link_training: simulate_link_training
 
+# Sweep many random per-lane skew patterns (2-DUT test) to prove robustness
+.PHONY: test_link_training_sweep
+test_link_training_sweep:
+	@mkdir -p $(OUT_DIR)
+	@pass=0; fail=0; \
+	for sd in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
+		iverilog -g2005 -P jesd204_pcs_link_training_tb.SEED=$$sd \
+			-o $(OUT_DIR)/lt_$$sd.vvp $(SRCS_LINK_TRAINING) 2>/dev/null; \
+		out=$$(vvp $(OUT_DIR)/lt_$$sd.vvp 2>/dev/null); \
+		res=$$(echo "$$out" | grep -E "SUCCESS|FAILED"); \
+		skew=$$(echo "$$out" | grep "Lane skews" | sed 's/.*: //'); \
+		echo "seed=$$sd  skews=[$$skew] : $$res"; \
+		echo "$$res" | grep -q SUCCESS && pass=$$((pass+1)) || fail=$$((fail+1)); \
+	done; \
+	echo "==== PASS=$$pass FAIL=$$fail ===="; \
+	[ "$$fail" -eq 0 ]
+
 # Run all tests
 .PHONY: test
 test: test_link_training test_simple

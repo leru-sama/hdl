@@ -1,105 +1,129 @@
-# JESD204 Soft PCS Wrapper - Standalone Project
+# JESD204 Soft PCS - Standalone Project
 
-This is a standalone project containing the JESD204 Soft PCS Wrapper with ready/valid handshake interface, extracted from the ADI HDL repository.
+Standalone project containing two JESD204 soft-PCS designs (extracted from the
+ADI HDL repository) targeting a **transparent serdes with 20-bit parallel data
+per lane** and a **ready/valid** application interface:
+
+1. **`jesd204_soft_pcs_wrapper`** — minimal PCS: 8b10b encode/decode, comma
+   (K28.5) pattern alignment, elastic FIFO with ready/valid handshake.
+2. **`jesd204_pcs_link_training`** — full PCS with **link training** (CGS → ILAS
+   → DATA) reusing ADI's `jesd204_tx_ctrl` / `jesd204_rx_ctrl` / `rx_cgs` /
+   `ilas_monitor` / `tx_lane` / `rx_lane` (elastic buffers). The upper layer only
+   deals with business payload over ready/valid; the PCS handles the whole
+   bring-up handshake and **multi-lane de-skew**.
 
 ## Directory Structure
 
 ```
 jesd204_pcs_standalone/
-├── code/                   # All Verilog source files
-│   ├── jesd204_soft_pcs_wrapper.v   # Top-level wrapper
-│   ├── jesd204_soft_pcs_fifo.v      # Elastic FIFO
-│   ├── jesd204_soft_pcs_tx.v        # PCS TX module
-│   ├── jesd204_8b10b_encoder.v      # 8b10b encoder
-│   ├── jesd204_soft_pcs_rx.v        # PCS RX module
-│   ├── jesd204_pattern_align.v      # Pattern alignment
-│   └── jesd204_8b10b_decoder.v      # 8b10b decoder
-├── script/                 # Build scripts and file lists
-│   ├── filelist.f          # Source file list for synthesis/tools
-│   └── run_sim.sh          # Simulation script
-├── sim/                    # Testbench files
-│   └── soft_pcs_wrapper_tb.v  # Self-checking testbench
-├── Makefile                # Build automation
-└── README.md               # This file
+├── code/                              # All Verilog source files
+│   ├── jesd204_pcs_link_training.v    # Top: PCS with link training (CGS/ILAS/DATA)
+│   ├── jesd204_soft_pcs_wrapper.v     # Top: minimal soft-PCS wrapper
+│   ├── jesd204_soft_pcs_fifo.v        # Elastic FIFO (minimal wrapper)
+│   ├── jesd204_tx_ctrl.v              # TX link-training FSM (WAIT/CGS/ILAS/DATA)
+│   ├── jesd204_rx_ctrl.v              # RX link-training FSM (RESET/CGS/SYNC)
+│   ├── jesd204_rx_cgs.v               # CGS (K28.5 comma) detection
+│   ├── jesd204_ilas_monitor.v         # ILAS parse + per-lane buffer release
+│   ├── jesd204_tx_lane.v / rx_lane.v  # Per-lane TX/RX datapath + elastic buffer
+│   ├── elastic_buffer.v               # Per-lane de-skew elastic buffer
+│   ├── jesd204_8b10b_encoder.v/.._decoder.v
+│   ├── jesd204_lmfc.v, jesd204_frame_mark.v, jesd204_scrambler.v, ...
+│   └── ...                            # Supporting ADI modules
+├── script/
+│   ├── filelist.f                     # Source file list for tools
+│   └── run_sim.sh                     # Simulation script (SWEEP=1 for skew sweep)
+├── sim/
+│   ├── jesd204_pcs_link_training_tb.v # 2-DUT link-training + multi-lane test
+│   └── soft_pcs_wrapper_tb.v          # minimal-wrapper loopback test
+├── Makefile
+└── README.md
 ```
 
-## Features
+## The 2-DUT link-training testbench
 
-- **Transparent Serdes Interface**: 20-bit per lane parallel data interface
-- **Ready/Valid Handshake**: Clean handshake interface for upper layer applications
-- **8b10b Encoding/Decoding**: Full JESD204 8b10b coding support
-- **Pattern Alignment**: Automatic comma (K28.5) detection and alignment
-- **Elastic Buffer**: FWFT FIFO for clock domain crossing and back-pressure handling
-- **Configurable**: Supports different DATA_PATH_WIDTH settings
+`sim/jesd204_pcs_link_training_tb.v` instantiates **two independent PCS DUTs**
+(no loopback of a single core):
+
+* `tx_device` drives the line; `rx_device` recovers it.
+* They are connected **only** through a 4-lane serdes model that injects a
+  **random per-lane skew** (0..16 parallel-clock cycles).
+* The RX parallel clock is **frequency-locked to the TX** (as a real
+  CDR-recovered clock is) but **phase-shifted** — the elastic buffers absorb the
+  phase offset and the inter-lane skew.
+
+Bring-up is fully autonomous: `rx_device`'s `sync_n` drives `tx_device`'s
+`sync_request_n`, so the TX only advances CGS→ILAS→DATA once the RX has locked.
+
+**Data-integrity check (latency-tolerant scoreboard):** the TX sends a marker
+preamble followed by a **per-lane distinct incrementing payload**; the RX
+capture is anchored on the preamble and every payload beat is compared on all
+lanes and octets. This proves both data integrity and correct lane de-skew.
+
+### Results
+
+Single run (default seed) and a 20-seed random-skew sweep all pass, including
+worst-case skews such as `[16,16,16,7]`:
+
+```
+seed=5  skews=[16,16,16,7] : SUCCESS: 2-DUT link training + data transfer verified across 4 lanes
+...
+==== PASS=20 FAIL=0 ====
+```
 
 ## Quick Start
 
-### Prerequisites
+Prerequisites: Icarus Verilog (`iverilog`), optionally GTKWave.
 
-- Icarus Verilog (iverilog)
-- GTKWave (optional, for waveform viewing)
+```bash
+# 2-DUT link-training test (single random-skew pattern)
+make simulate_link_training
 
-### Running Simulation
+# Sweep 20 random per-lane skew patterns through the 2-DUT test
+make test_link_training_sweep
 
-1. **Single test** (default bitshift=0):
-   ```bash
-   make simulate
-   ```
+# Minimal soft-PCS wrapper sweep (serdes bit-slip 0..9)
+make test_simple
 
-2. **Full sweep test** (bitshift 0-9):
-   ```bash
-   make test
-   ```
+# Everything
+make test
 
-3. **Using the script directly**:
-   ```bash
-   ./script/run_sim.sh
-   ```
-
-### Using the Source Files
-
-The `script/filelist.f` contains all source files needed for synthesis or simulation tools. Paths are relative to the `code/` directory.
-
-For synthesis tools, use:
-```
--f script/filelist.f
+# Or via the script (SWEEP=1 adds the skew sweep)
+SWEEP=1 ./script/run_sim.sh
 ```
 
-## Interface Description
+`script/filelist.f` lists all sources for synthesis/sim tools (paths relative to
+`code/`); use `-f script/filelist.f`.
 
-### Top-Level Wrapper (`jesd204_soft_pcs_wrapper`)
+## `jesd204_pcs_link_training` interface
 
-#### Clock/Reset
-- `clk`: Clock input
-- `reset`: Synchronous reset
+Clock/reset: `clk`, `reset`.
 
-#### TX Interface (Application → Serdes)
-- `tx_valid`: Data valid from application
-- `tx_ready`: Ready to accept data
-- `tx_data[15:0]`: 8-bit characters (2 symbols per beat)
-- `tx_charisk[1:0]`: K-character flags
+Configuration: `cfg_octets_per_multiframe`, `cfg_octets_per_frame`,
+`cfg_lanes_disable`, `cfg_links_disable`, `cfg_disable_scrambler`,
+`cfg_disable_char_replacement`, `cfg_mframes_per_ilas`, `cfg_skip_ilas`,
+`cfg_continuous_cgs`, `cfg_continuous_ilas`.
 
-#### RX Interface (Serdes → Application)
-- `rx_valid`: Data valid to application
-- `rx_ready`: Application ready to accept data
-- `rx_data[15:0]`: 8-bit characters (2 symbols per beat)
-- `rx_charisk[1:0]`: K-character flags
-- `rx_notintable[1:0]`: Not-in-table error flags
-- `rx_disperr[1:0]`: Disparity error flags
+TX application (ready/valid): `tx_valid`, `tx_ready`,
+`tx_data[DATA_PATH_WIDTH*8*NUM_LANES-1:0]`, `tx_charisk`.
 
-#### Serdes Interface
-- `serdes_tx_data[19:0]`: 20-bit encoded data to serdes
-- `serdes_rx_data[19:0]`: 20-bit data from serdes
+RX application (ready/valid): `rx_valid`, `rx_ready`, `rx_data`, `rx_charisk`,
+`rx_notintable`, `rx_disperr`.
 
-#### Status
-- `rx_overflow`: Elastic buffer overflow flag
-- `rx_enable`: Enable RX capture (after pattern alignment)
+Serdes: `serdes_tx_data`, `serdes_rx_data` (`DATA_PATH_WIDTH*10` bits/lane = 20b
+for `DATA_PATH_WIDTH=2`).
 
-## Configuration Parameters
+Link control/status: `sync_request_n` (from remote RX), `sync_n` (to remote TX),
+`status_ctrl_state` (00=RESET, 01=CGS, 10=ILAS, 11=DATA),
+`status_lane_cgs_state`, `status_lane_ifs_ready`, `ilas_config_*`,
+`status_err_statistics_cnt`.
 
-- `DATA_PATH_WIDTH`: Number of 10b symbols per clock (default: 2 for 20-bit lanes)
-- `IFC_TYPE`: Interface type (0 for parallel, default)
+## Parameters
+
+- `NUM_LANES` — serdes lanes (test uses 4).
+- `NUM_LINKS` — links (1).
+- `DATA_PATH_WIDTH` — 10b symbols per clock; **2 → 20-bit serdes lanes**.
+- `ENABLE_FRAME_ALIGN_CHECK`, `ENABLE_CHAR_REPLACE`, `ELASTIC_BUFFER_SIZE`.
 
 ## License
 
-BSD-1-Clause (same as original ADI HDL repository)
+BSD-1-Clause (same as the original ADI HDL repository).
