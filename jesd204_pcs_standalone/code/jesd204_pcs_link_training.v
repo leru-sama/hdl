@@ -5,7 +5,112 @@
 // Copyright (C) 2024 Analog Devices, Inc. All rights reserved.
 // SPDX short identifier: ADIJESD204
 // ***************************************************************************
-
+//
+// Top-level wrapper integrating:
+//   - TX: scrambler, char-replace (/A/ /F/), 8b10b encoder
+//   - RX: 8b10b decoder, descrambler, frame-align monitor,
+//         per-lane elastic buffer (lane de-skew), CGS detect
+//   - Link training FSM: CGS -> ILAS -> DATA
+//   - Frame-align error detection -> auto resync (ENABLE_FRAME_ALIGN_ERR_RESET)
+//
+// ===== Signal Reference =====
+//
+// -- Clock / Reset --
+//   clk                  : Single clock domain for both TX and RX datapaths.
+//                          In silicon this would typically be the device clock;
+//                          in simulation both sides share this clock and the
+//                          serdes model injects per-lane skew.
+//   reset                 : Synchronous active-high reset.
+//
+// -- Configuration --
+//   cfg_octets_per_multiframe [9:0] : Number of octets in one multiframe (K).
+//                          Must be a multiple of DATA_PATH_WIDTH. Typical: 32.
+//   cfg_octets_per_frame      [7:0] : Number of octets in one frame (F).
+//                          Supported values depend on DATA_PATH_WIDTH.
+//                          For DPW=8: F=8 is a common choice.
+//   cfg_lanes_disable  [NUM_LANES-1:0] : Per-lane disable (1 = lane disabled).
+//   cfg_links_disable  [NUM_LINKS-1:0] : Per-link disable (1 = link disabled).
+//   cfg_disable_scrambler          : 1 = bypass scrambler/descrambler.
+//   cfg_disable_char_replacement   : 1 = do not insert /A/ /F/ alignment chars.
+//   cfg_mframes_per_ilas       [7:0] : Number of multiframes in one ILAS sequence (M).
+//   cfg_skip_ilas                   : 1 = skip ILAS, go straight from CGS to DATA.
+//   cfg_continuous_cgs              : 1 = stay in CGS (used for initial bring-up).
+//   cfg_continuous_ilas             : 1 = repeat ILAS continuously.
+//
+// -- TX Application Interface (ready/valid handshake) --
+//   tx_valid                    : Application data valid strobe.
+//   tx_ready                    : PCS ready to accept tx_data (during DATA phase).
+//   tx_data [DATA_PATH_WIDTH*8*NUM_LANES-1:0] : Application payload, packed as
+//                          [lane0_char0, lane0_char1, ..., lane3_char7].
+//   tx_charisk  [DATA_PATH_WIDTH*NUM_LANES-1:0] : Per-character control flag.
+//                          1 = this 8b character is a control character (Kx.y).
+//
+// -- RX Application Interface (ready/valid handshake) --
+//   rx_valid                    : rx_data / rx_charisk are valid this cycle.
+//   rx_ready                    : Application is ready to consume RX data.
+//   rx_data [DATA_PATH_WIDTH*8*NUM_LANES-1:0] : Decoded application payload.
+//   rx_charisk  [DATA_PATH_WIDTH*NUM_LANES-1:0] : Per-character control flag.
+//   rx_notintable [DATA_PATH_WIDTH*NUM_LANES-1:0] : 8b10b not-in-table error per char.
+//   rx_disperr    [DATA_PATH_WIDTH*NUM_LANES-1:0] : 8b10b disparity error per char.
+//
+// -- Serdes Interface --
+//   serdes_tx_data [DATA_PATH_WIDTH*10*NUM_LANES-1:0] : Parallel 8b10b-encoded
+//                          symbols to the serdes TX. Packed per lane:
+//                          [lane0_sym0, lane0_sym1, ..., lane3_sym7].
+//                          Each symbol is 10 bits wide.
+//                          = DATA_PATH_WIDTH * 10 bits per lane.
+//   serdes_rx_data [DATA_PATH_WIDTH*10*NUM_LANES-1:0] : Parallel 8b10b symbols
+//                          from the serdes RX (CDR-recovered clock domain).
+//                          Same packing as serdes_tx_data.
+//
+// -- Link Control / Status (between two PCS instances) --
+//   sync_request_n [NUM_LINKS-1:0] : From the remote RX device. ACTIVE-LOW.
+//                          Driven by the RX's rx_ctrl: low = "please send CGS".
+//                          This is the input that triggers the TX state machine
+//                          to leave WAIT and enter CGS -> ILAS -> DATA.
+//   status_ctrl_state        [1:0] : Current TX state machine state.
+//                          2'b00 = RESET, 2'b01 = CGS, 2'b10 = ILAS, 2'b11 = DATA.
+//   status_lane_cgs_state [2*NUM_LANES-1:0] : Per-lane CGS detector state (2 bits each).
+//   status_lane_ifs_ready  [NUM_LANES-1:0] : Per-lane ILAS monitor IFS ready.
+//   sync_n            [NUM_LINKS-1:0] : To the remote TX device. ACTIVE-LOW.
+//                          Driven by the local RX's rx_ctrl: low = "I am in CGS,
+//                          please keep sending K28.5". Registered for CDC.
+//
+// -- ILAS Configuration (from RX ILAS monitor to upper layer) --
+//   ilas_config_valid  [NUM_LANES-1:0] : One-hot: lane i has valid ILAS config.
+//   ilas_config_addr   [NUM_LANES*2-1:0] : 2-bit config address per lane
+//                          (0=R/ADJCNT, 1=Q/ADJDIR, 2=F/MF, 3=K/CS).
+//   ilas_config_data   [NUM_LANES*DATA_PATH_WIDTH*8-1:0] : Config data per lane.
+//
+// -- Error Status --
+//   status_err_statistics_cnt [32*NUM_LANES-1:0] : 32-bit error counter per lane.
+//                          Increments on 8b10b not-in-table / disparity errors.
+//                          Reset on each event_data_phase (start of DATA).
+//   status_frame_align_err_cnt_0 [NUM_LANES-1:1:0] : Frame-align error counter
+//                          for lane 0 (8 bits). Mirror of the internal per-lane
+//                          frame_align_err_cnt[i] for the first lane only;
+//                          use this for quick debug visibility.
+//   event_frame_alignment_error           : Sticky OR of per-lane
+//                          frame_align_err_thresh_met. Pulses high when any
+//                          enabled lane has accumulated >= FRAME_ALIGN_ERR_THRESHOLD
+//                          frame-align errors and ENABLE_FRAME_ALIGN_ERR_RESET=1.
+//                          This triggers rx_ctrl to drop back to RESET/CGS.
+//
+// ===== Parameters =====
+//   NUM_LANES                  : Number of serdes lanes (default 1).
+//   NUM_LINKS                  : Number of JESD204 links (default 1).
+//   DATA_PATH_WIDTH            : 8b symbols per clock per lane.
+//                               8 = 80b/lane serdes interface (default, 256b total).
+//                               4 = 40b/lane.  2 = 20b/lane.
+//   ENABLE_FRAME_ALIGN_CHECK   : 1 = instantiate rx_frame_align to monitor /A/ /F/
+//                                positioning (default 1).
+//   ENABLE_CHAR_REPLACE        : 1 = TX inserts /A/ at EOMF, /F/ at EOF
+//                                via jesd204_frame_align_replace (default 1).
+//   ENABLE_FRAME_ALIGN_ERR_RESET: 1 = rx_ctrl resets to CGS when frame-align
+//                                error threshold is crossed (default 1).
+//   FRAME_ALIGN_ERR_THRESHOLD  : Error count before asserting resync (default 16).
+//   ELASTIC_BUFFER_SIZE        : Per-lane elastic buffer depth in bits (default 256).
+//
 `timescale 1ns/100ps
 
 module jesd204_pcs_link_training #(
@@ -121,8 +226,41 @@ module jesd204_pcs_link_training #(
     .sysref_alignment_error());
 
   // ---------------------------------------------------------------
-  // Frame Marking
+  // Internal signals
   // ---------------------------------------------------------------
+  //
+  // -- TX internal --
+  // tx_phy_data / tx_phy_charisk  : Post-scramble, pre-8b10b-encode data.
+  // lane_cgs_enable               : Per-lane CGS enable (from tx_ctrl).
+  // tx_ctrl_ready                 : TX ready to accept app data (= tx_ready).
+  // ilas_data / ilas_charisk      : ILAS payload from tx_ctrl to tx_lane.
+  // ilas_config_addr_tx           : ILAS config read address from tx_ctrl.
+  // ilas_config_rd                : ILAS config read strobe from tx_ctrl.
+  // ilas_config_data_tx           : ILAS config data read by tx_ctrl (from app).
+  // eof_reset                     : EOF reset pulse (resets ILAS/tx_ctrl state).
+  // tx_ready_nx                   : Next-cycle tx_ready (pipeline).
+  // tx_next_mf_ready              : TX ready at next multiframe boundary.
+  //
+  // -- RX internal --
+  // rx_phy_data / rx_phy_charisk  : Post-8b10b-decode, pre-descramble data.
+  // rx_phy_notintable / rx_phy_disperr : 8b10b decode error flags per char.
+  // cgs_reset                     : Per-lane CGS reset (from rx_ctrl).
+  // cgs_ready                     : Per-lane CGS detected (from rx_cgs).
+  // ifs_reset                     : Per-lane IFS (inter-frame sync) reset.
+  // phy_en_char_align             : Enable char-align mux in rx_lane.
+  // sync_n_int                    : Internal sync_n before CDC register.
+  // latency_monitor_reset         : Reset latency monitor in rx_ctrl.
+  // event_data_phase              : Pulse on CGS->SYNCHRONIZED transition.
+  // lmfc_edge                     : Local multi-frame clock edge (from lmfc).
+  //
+  // -- Frame marking --
+  // sof / eof                     : Start/end of frame per DPW position.
+  // somf / eomf                   : Start/end of multiframe per DPW position.
+  //
+  // -- Frame-align error monitoring --
+  // frame_align_err_thresh_met    : Per-lane flag: error count >= threshold.
+  // frame_align_err_cnt_w         : Raw 8-bit error counter from rx_lane.
+  // frame_align_err_cnt           : Registered copy of the error counter.
   jesd204_frame_mark #(
     .DATA_PATH_WIDTH(DATA_PATH_WIDTH)
   ) i_frame_mark (
