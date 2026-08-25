@@ -264,6 +264,12 @@ module jesd204_pcs_link_training_tb;
 
     $display("[%0t] Sending data from TX to RX...", $time);
 
+    // Debug: check serdes signals
+    $display("[%0t] TX serdes[19:0]=%020b", $time, tx_serdes_data[19:0]);
+    $display("[%0t] RX serdes[19:0]=%020b", $time, rx_serdes_data[19:0]);
+    $display("[%0t] TX phy_data[15:0]=%016h", $time, tx_device.tx_phy_data[15:0]);
+    $display("[%0t] RX phy_data[15:0]=%016h", $time, rx_device.rx_phy_data[15:0]);
+
     fork
       begin : tx_send
         integer k;
