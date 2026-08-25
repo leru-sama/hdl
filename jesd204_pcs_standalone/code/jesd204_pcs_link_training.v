@@ -320,6 +320,44 @@ module jesd204_pcs_link_training #(
   // RX Lane (per lane)
   // ---------------------------------------------------------------
 
+  wire [NUM_LANES-1:0] buffer_ready_n;
+  wire all_buffer_ready_n;
+  reg buffer_release_n = 1'b1;
+  reg buffer_release_opportunity = 1'b0;
+  reg [7:0] lmfc_counter_reg = 8'd0;
+
+  // Track LMFC counter for buffer release timing
+  always @(posedge clk) begin
+    if (reset) begin
+      lmfc_counter_reg <= 8'd0;
+    end else if (lmfc_edge) begin
+      lmfc_counter_reg <= 8'd0;
+    end else begin
+      lmfc_counter_reg <= lmfc_counter_reg + 1'b1;
+    end
+  end
+
+  // Buffer release opportunity at LMFC boundary (with configurable delay)
+  always @(posedge clk) begin
+    if (lmfc_counter_reg == 8'd2) begin  // Small delay after LMFC edge
+      buffer_release_opportunity <= 1'b1;
+    end else begin
+      buffer_release_opportunity <= 1'b0;
+    end
+  end
+
+  // All lanes ready when no lane has buffer_ready_n asserted
+  assign all_buffer_ready_n = |buffer_ready_n;
+
+  // Release buffers when all lanes are ready and at LMFC boundary
+  always @(posedge clk) begin
+    if (reset) begin
+      buffer_release_n <= 1'b1;
+    end else if (buffer_release_opportunity && !all_buffer_ready_n) begin
+      buffer_release_n <= 1'b0;  // Release
+    end
+  end
+
   generate
     for (i = 0; i < NUM_LANES; i = i + 1) begin : gen_rx_lane
       localparam D_START = i * DATA_PATH_WIDTH * 8;
@@ -350,8 +388,8 @@ module jesd204_pcs_link_training #(
         .cgs_ready(cgs_ready[i]),
         .ifs_reset(ifs_reset[i]),
         .rx_data(rx_data[D_STOP:D_START]),
-        .buffer_ready_n(),
-        .buffer_release_n(1'b0),
+        .buffer_ready_n(buffer_ready_n[i]),
+        .buffer_release_n(buffer_release_n),
         .cfg_octets_per_multiframe(cfg_octets_per_multiframe),
         .cfg_octets_per_frame(cfg_octets_per_frame),
         .cfg_disable_char_replacement(cfg_disable_char_replacement),
@@ -369,8 +407,8 @@ module jesd204_pcs_link_training #(
     end
   endgenerate
 
-  // RX valid - simplified: valid when in data phase
-  assign rx_valid = &cgs_ready;
+  // RX valid - after buffer release
+  assign rx_valid = ~buffer_release_n;
   assign rx_charisk = rx_phy_charisk;
   assign rx_notintable = rx_phy_notintable;
   assign rx_disperr = rx_phy_disperr;

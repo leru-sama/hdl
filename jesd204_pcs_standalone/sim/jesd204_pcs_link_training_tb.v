@@ -1,6 +1,6 @@
 // ***************************************************************************
 // JESD204 PCS Link Training Testbench
-// Verifies CGS -> ILAS -> DATA phase transitions
+// Verifies CGS -> ILAS -> DATA with multi-lane skew tolerance
 // ***************************************************************************
 `timescale 1ns/100ps
 
@@ -9,10 +9,11 @@ module jesd204_pcs_link_training_tb;
   // ---------------------------------------------------------------
   // Parameters
   // ---------------------------------------------------------------
-  parameter NUM_LANES = 1;
+  parameter NUM_LANES = 2;              // Test with 2 lanes
   parameter NUM_LINKS = 1;
   parameter DATA_PATH_WIDTH = 2;
-  parameter CLK_PERIOD = 10;  // 100 MHz
+  parameter CLK_PERIOD = 10;
+  parameter LANE_SKEW_CYCLES = 3;      // Max skew between lanes in clock cycles
 
   // ---------------------------------------------------------------
   // Signals
@@ -46,7 +47,7 @@ module jesd204_pcs_link_training_tb;
   wire [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_notintable;
   wire [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_disperr;
 
-  // Serdes Interface (loopback)
+  // Serdes Interface
   wire [DATA_PATH_WIDTH*10*NUM_LANES-1:0] serdes_tx_data;
   wire [DATA_PATH_WIDTH*10*NUM_LANES-1:0] serdes_rx_data;
 
@@ -57,9 +58,7 @@ module jesd204_pcs_link_training_tb;
   wire [NUM_LINKS-1:0] sync_n;
   wire [NUM_LANES-1:0] ilas_config_valid;
   wire [NUM_LANES*2-1:0] ilas_config_addr;
-  wire [NUM_LANES*DATA_PATH_WIDTH*8-1:0] ilas_config_data;
-  wire [32*NUM_LANES-1:0] status_err_statistics_cnt;
-  wire event_frame_alignment_error;
+  wire [NUM_LANES*DATA_PATH_WIDTH*8-1:0] serdes_rx_data_delayed;
 
   // Test control
   integer tx_count;
@@ -73,6 +72,44 @@ module jesd204_pcs_link_training_tb;
   always #(CLK_PERIOD/2) clk = ~clk;
 
   // ---------------------------------------------------------------
+  // Serdes with per-lane random skew
+  // ---------------------------------------------------------------
+  // Lane 0: no delay
+  // Lane 1: random delay (1-LANE_SKEW_CYCLES cycles)
+
+  reg [DATA_PATH_WIDTH*10-1:0] lane0_pipe [0:LANE_SKEW_CYCLES];
+  reg [DATA_PATH_WIDTH*10-1:0] lane1_pipe [0:LANE_SKEW_CYCLES];
+
+  integer lane1_delay;
+  integer i;
+
+  initial begin
+    // Random delay for lane 1 (1 to LANE_SKEK_CYCLES)
+    lane1_delay = $urandom_range(1, LANE_SKEW_CYCLES);
+    $display("Lane 1 delay: %0d clock cycles", lane1_delay);
+  end
+
+  // Pipeline for lane 0 (no delay)
+  always @(posedge clk) begin
+    lane0_pipe[0] <= serdes_tx_data[DATA_PATH_WIDTH*10-1:0];
+    for (i = 1; i <= LANE_SKEW_CYCLES; i = i + 1) begin
+      lane0_pipe[i] <= lane0_pipe[i-1];
+    end
+  end
+
+  // Pipeline for lane 1 (with delay)
+  always @(posedge clk) begin
+    lane1_pipe[0] <= serdes_tx_data[DATA_PATH_WIDTH*10*2-1:DATA_PATH_WIDTH*10];
+    for (i = 1; i <= LANE_SKEW_CYCLES; i = i + 1) begin
+      lane1_pipe[i] <= lane1_pipe[i-1];
+    end
+  end
+
+  // Select delayed signals
+  assign serdes_rx_data[DATA_PATH_WIDTH*10-1:0] = lane0_pipe[0];  // Lane 0: no delay
+  assign serdes_rx_data[DATA_PATH_WIDTH*10*2-1:DATA_PATH_WIDTH*10] = lane1_pipe[lane1_delay];  // Lane 1: delayed
+
+  // ---------------------------------------------------------------
   // DUT instantiation
   // ---------------------------------------------------------------
   jesd204_pcs_link_training #(
@@ -81,7 +118,7 @@ module jesd204_pcs_link_training_tb;
     .DATA_PATH_WIDTH(DATA_PATH_WIDTH),
     .ENABLE_FRAME_ALIGN_CHECK(0),
     .ENABLE_CHAR_REPLACE(0),
-    .ELASTIC_BUFFER_SIZE(64)
+    .ELASTIC_BUFFER_SIZE(128)
   ) dut (
     .clk(clk),
     .reset(reset),
@@ -113,14 +150,9 @@ module jesd204_pcs_link_training_tb;
     .sync_n(sync_n),
     .ilas_config_valid(ilas_config_valid),
     .ilas_config_addr(ilas_config_addr),
-    .ilas_config_data(ilas_config_data),
-    .status_err_statistics_cnt(status_err_statistics_cnt),
-    .event_frame_alignment_error(event_frame_alignment_error));
-
-  // ---------------------------------------------------------------
-  // Serdes loopback (transparent)
-  // ---------------------------------------------------------------
-  assign serdes_rx_data = serdes_tx_data;
+    .ilas_config_data(),
+    .status_err_statistics_cnt(),
+    .event_frame_alignment_error());
 
   // ---------------------------------------------------------------
   // Test sequence
@@ -128,12 +160,12 @@ module jesd204_pcs_link_training_tb;
   initial begin
     // Initialize
     reset = 1;
-    cfg_octets_per_multiframe = 10'd64;   // Small multiframe for faster simulation
-    cfg_octets_per_frame = 8'd4;          // 4 octets per frame
+    cfg_octets_per_multiframe = 10'd64;
+    cfg_octets_per_frame = 8'd4;
     cfg_lanes_disable = {NUM_LANES{1'b0}};
     cfg_links_disable = {NUM_LINKS{1'b0}};
-    cfg_disable_scrambler = 1'b1;         // Disable scrambler for simpler debug
-    cfg_disable_char_replacement = 1'b1;  // Disable char replacement for simpler debug
+    cfg_disable_scrambler = 1'b1;
+    cfg_disable_char_replacement = 1'b1;
     cfg_mframes_per_ilas = 8'd4;
     cfg_skip_ilas = 1'b0;
     cfg_continuous_cgs = 1'b0;
@@ -152,23 +184,27 @@ module jesd204_pcs_link_training_tb;
     repeat(20) @(posedge clk);
 
     // ---------------------------------------------------------------
-    // Wait for link training to complete (DATA state)
+    // Wait for link training to complete
     // ---------------------------------------------------------------
-    $display("[%0t] Waiting for link training...", $time);
+    $display("[%0t] Waiting for link training with %0d lanes (lane 1 skew = %0d cycles)...", 
+             $time, NUM_LANES, lane1_delay);
 
     // Wait for TX to enter DATA state
     wait(status_ctrl_state == 2'b11);
-    $display("[%0t] TX entered DATA state - link training complete!", $time);
+    $display("[%0t] TX entered DATA state", $time);
 
-    // Wait a bit more for RX to stabilize
-    repeat(100) @(posedge clk);
+    // Wait for RX buffer release (rx_valid goes high)
+    wait(rx_valid == 1'b1);
+    $display("[%0t] RX buffer released - lane alignment complete!", $time);
+
+    // Wait a bit more for stabilization
+    repeat(50) @(posedge clk);
 
     // ---------------------------------------------------------------
     // Data transfer test
     // ---------------------------------------------------------------
     $display("[%0t] Starting data transfer test...", $time);
 
-    // Send data from TX application
     fork
       // TX process
       begin : tx_process
@@ -179,8 +215,8 @@ module jesd204_pcs_link_training_tb;
           if (tx_ready) begin
             tx_valid = 1'b1;
             tx_byte = i[7:0];
-            tx_data = {DATA_PATH_WIDTH{tx_byte}};
-            tx_charisk = {DATA_PATH_WIDTH{1'b0}};
+            tx_data = {NUM_LANES{tx_byte, tx_byte}};  // 2 bytes per lane
+            tx_charisk = {NUM_LANES{2'b00}};
             tx_count = tx_count + 1;
           end else begin
             tx_valid = 1'b0;
@@ -207,17 +243,19 @@ module jesd204_pcs_link_training_tb;
     repeat(100) @(posedge clk);
 
     $display("========================================");
-    $display("Test Results:");
+    $display("Test Results (Multi-lane with skew):");
+    $display("  NUM_LANES: %0d", NUM_LANES);
+    $display("  Lane 1 delay: %0d cycles", lane1_delay);
     $display("  TX count: %0d", tx_count);
     $display("  RX count: %0d", rx_count);
     $display("  Errors:   %0d", error_count);
     $display("  Final state: %0b", status_ctrl_state);
     $display("========================================");
 
-    if (status_ctrl_state == 2'b11 && tx_count > 0) begin
-      $display("SUCCESS: Link training completed, data transfer verified");
+    if (status_ctrl_state == 2'b11 && rx_valid && tx_count > 0) begin
+      $display("SUCCESS: Multi-lane link training with skew completed");
     end else begin
-      $display("FAILED: Link training or data transfer failed");
+      $display("FAILED: Link training or lane alignment failed");
     end
 
     $finish;
@@ -227,12 +265,11 @@ module jesd204_pcs_link_training_tb;
   // Timeout watchdog
   // ---------------------------------------------------------------
   initial begin
-    #500000;  // 500us timeout
+    #1000000;  // 1ms timeout
     $display("TIMEOUT: Test did not complete");
     $display("  status_ctrl_state: %0b", status_ctrl_state);
-    $display("  status_lane_cgs_state: %0b", status_lane_cgs_state);
     $display("  sync_n: %0b", sync_n);
-    $display("  tx_ready: %0b", tx_ready);
+    $display("  rx_valid: %0b", rx_valid);
     $finish;
   end
 
