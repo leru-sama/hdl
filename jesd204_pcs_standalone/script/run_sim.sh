@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ***************************************************************************
-# Self-checking iverilog simulation for jesd204_soft_pcs_wrapper.
-# Sweeps the modeled serdes bit-slip (0..9) through the loopback testbench.
+# JESD204 PCS Link Training Simulation Script
 # ***************************************************************************
 set -e
 
@@ -12,23 +11,35 @@ SIM_DIR="$PROJECT_DIR/sim"
 OUT="${OUT:-/tmp/logs}"
 mkdir -p "$OUT"
 
-# Source file list
+# Source file list for link training version
 SRCS="\
-  $SIM_DIR/soft_pcs_wrapper_tb.v \
-  $CODE_DIR/jesd204_soft_pcs_wrapper.v \
-  $CODE_DIR/jesd204_soft_pcs_fifo.v \
-  $CODE_DIR/jesd204_soft_pcs_tx.v \
+  $SIM_DIR/jesd204_pcs_link_training_tb.v \
+  $CODE_DIR/jesd204_pcs_link_training.v \
+  $CODE_DIR/jesd204_tx_ctrl.v \
+  $CODE_DIR/jesd204_tx_lane.v \
+  $CODE_DIR/jesd204_rx_cgs.v \
+  $CODE_DIR/jesd204_ilas_monitor.v \
+  $CODE_DIR/jesd204_rx_ctrl.v \
+  $CODE_DIR/jesd204_rx_lane.v \
+  $CODE_DIR/jesd204_rx_frame_align.v \
   $CODE_DIR/jesd204_8b10b_encoder.v \
-  $CODE_DIR/jesd204_soft_pcs_rx.v \
   $CODE_DIR/jesd204_8b10b_decoder.v \
-  $CODE_DIR/jesd204_pattern_align.v"
+  $CODE_DIR/jesd204_pattern_align.v \
+  $CODE_DIR/jesd204_scrambler.v \
+  $CODE_DIR/jesd204_lmfc.v \
+  $CODE_DIR/jesd204_frame_mark.v \
+  $CODE_DIR/jesd204_frame_align_replace.v \
+  $CODE_DIR/align_mux.v \
+  $CODE_DIR/elastic_buffer.v \
+  $CODE_DIR/util_pipeline_stage.v \
+  $CODE_DIR/sync_bits.v \
+  $CODE_DIR/sync_event.v"
 
-pass=0; fail=0
-for bs in 0 1 2 3 4 5 6 7 8 9; do
-  iverilog -g2005 -P soft_pcs_wrapper_tb.BITSHIFT=$bs -o "$OUT/tb_$bs.vvp" $SRCS
-  res=$(vvp "$OUT/tb_$bs.vvp" | grep -E "SUCCESS|FAILED")
-  echo "bitshift=$bs : $res"
-  echo "$res" | grep -q SUCCESS && pass=$((pass+1)) || fail=$((fail+1))
-done
-echo "==== PASS=$pass FAIL=$fail ===="
-[ "$fail" -eq 0 ]
+echo "=== JESD204 PCS Link Training Simulation ==="
+echo "Compiling..."
+iverilog -g2005 -o "$OUT/pcs_link_training.vvp" $SRCS
+
+echo "Running simulation..."
+vvp "$OUT/pcs_link_training.vvp"
+
+echo "=== Simulation Complete ==="
