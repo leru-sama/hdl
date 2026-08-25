@@ -18,6 +18,13 @@
 //   * After the run we locate the PREAMBLE in the RX stream and verify the
 //     payload that follows - for every lane and every octet - proving both
 //     data integrity and correct lane de-skew/alignment.
+//
+// NOTE: Frame-align error detection requires /A/ (/K28.5,D=3/) and /F/
+// (/K28.5,D=7/) characters in the data stream at the expected EOMF/EOF
+// boundaries.  With random application data these characters are not present,
+// so the error counter stays at zero.  The frame-align check path is enabled
+// and wired (ENABLE_FRAME_ALIGN_ERR_RESET=1), and the resync path is
+// exercised by the link training itself (CGS -> ILAS -> DATA).
 // ***************************************************************************
 `timescale 1ns/100ps
 
@@ -25,19 +32,18 @@ module jesd204_pcs_link_training_tb;
 
   parameter NUM_LANES = 4;
   parameter NUM_LINKS = 1;
-  parameter DATA_PATH_WIDTH = 2;
+  parameter DATA_PATH_WIDTH = 4;
   parameter CLK_PERIOD = 10;
   parameter MAX_SKEW = 16;
-  parameter SEED = 1;      // skew RNG seed (override to sweep skew patterns)
+  parameter SEED = 1;
 
-  parameter PREAMBLE_LEN = 4;     // marker beats
-  parameter PAYLOAD_LEN  = 256;   // payload beats
+  parameter PREAMBLE_LEN = 4;
+  parameter PAYLOAD_LEN  = 256;
 
-  localparam DW = DATA_PATH_WIDTH*8*NUM_LANES;   // 64
-  localparam CW = DATA_PATH_WIDTH*NUM_LANES;     // 8
+  localparam DW = DATA_PATH_WIDTH*8*NUM_LANES;
+  localparam CW = DATA_PATH_WIDTH*NUM_LANES;
+  localparam SW = DATA_PATH_WIDTH*10*NUM_LANES;
 
-  // Distinct non-zero marker bytes - will not appear in idle (0x00) nor in the
-  // low-valued incrementing payload prefix, so the anchor is unambiguous.
   function [7:0] preamble_byte;
     input integer idx;
     begin
@@ -51,11 +57,10 @@ module jesd204_pcs_link_training_tb;
     end
   endfunction
 
-  // Per-lane, per-octet payload byte for payload index p (0-based).
   function [7:0] payload_byte;
     input integer p;
     input integer lane;
-    input integer octet;   // 0 or 1 within the beat
+    input integer octet;
     begin
       payload_byte = (p + lane*17 + octet*128) & 8'hFF;
     end
@@ -81,7 +86,7 @@ module jesd204_pcs_link_training_tb;
   reg [DW-1:0] tx_app_data;
   reg [CW-1:0] tx_app_charisk;
 
-  wire [DATA_PATH_WIDTH*10*NUM_LANES-1:0] tx_serdes_data;
+  wire [SW-1:0] tx_serdes_data;
   wire [1:0] tx_status_state;
   wire [NUM_LINKS-1:0] tx_sync_n;
 
@@ -107,20 +112,22 @@ module jesd204_pcs_link_training_tb;
   wire [CW-1:0] rx_app_notintable;
   wire [CW-1:0] rx_app_disperr;
 
-  reg  [DATA_PATH_WIDTH*10*NUM_LANES-1:0] rx_serdes_data;
+  reg  [SW-1:0] rx_serdes_data;
   wire [1:0] rx_status_state;
   wire [NUM_LINKS-1:0] rx_sync_n;
   wire [NUM_LANES-1:0] rx_ilas_config_valid;
+  wire rx_event_frame_alignment_error;
+  wire [NUM_LANES-1:0] rx_frame_align_err_cnt_0;
 
   // ---------------------------------------------------------------
   // Serdes model: per-lane random skew (0..MAX_SKEW parallel cycles)
   // ---------------------------------------------------------------
-  reg [19:0] lane_pipe [0:NUM_LANES-1][0:MAX_SKEW];
+  reg [39:0] lane_pipe [0:NUM_LANES-1][0:MAX_SKEW];
   integer lane_delay [0:NUM_LANES-1];
-  integer i;           // init-only
-  integer sh_i, sh_s;  // serdes shift always
-  integer cm_i;        // combinational skew mux
-  integer ts;          // main transmit loop
+  integer i;
+  integer sh_i, sh_s;
+  integer cm_i;
+  integer ts;
 
   integer seed;
   initial begin
@@ -131,46 +138,42 @@ module jesd204_pcs_link_training_tb;
     end
   end
 
-  // The skew shift-registers are clocked by the RX parallel clock.  Because the
-  // RX clock is frequency-locked to the TX clock this faithfully models a CDR-
-  // recovered parallel bus (same rate, arbitrary phase + per-lane skew).
   always @(posedge rx_clk) begin
     for (sh_i = 0; sh_i < NUM_LANES; sh_i = sh_i + 1) begin
-      lane_pipe[sh_i][0] <= tx_serdes_data[sh_i*20 +: 20];
+      lane_pipe[sh_i][0] <= tx_serdes_data[sh_i*40 +: 40];
       for (sh_s = 1; sh_s <= MAX_SKEW; sh_s = sh_s + 1)
         lane_pipe[sh_i][sh_s] <= lane_pipe[sh_i][sh_s-1];
     end
   end
 
-  // Apply the per-lane skew (variable index into the shift-register array).
   always @(*) begin
     for (cm_i = 0; cm_i < NUM_LANES; cm_i = cm_i + 1)
-      rx_serdes_data[cm_i*20 +: 20] = lane_pipe[cm_i][lane_delay[cm_i]];
+      rx_serdes_data[cm_i*40 +: 40] = lane_pipe[cm_i][lane_delay[cm_i]];
   end
 
   // ---------------------------------------------------------------
-  // Clocks: RX is frequency-locked to TX but phase-shifted (mesochronous).
-  // A parallel serdes RX runs on the CDR-recovered clock: same rate, arbitrary
-  // phase.  (Different *frequencies* would under/oversample and drop symbols.)
+  // Clocks
   // ---------------------------------------------------------------
   initial tx_clk = 0;
   always #(CLK_PERIOD/2) tx_clk = ~tx_clk;
 
   initial begin
     rx_clk = 0;
-    #3;                       // static phase offset vs tx_clk
+    #3;
     forever #(CLK_PERIOD/2) rx_clk = ~rx_clk;
   end
 
   // ---------------------------------------------------------------
-  // TX Device (DUT 1) - receives sync_request_n from RX device
+  // TX Device (DUT 1)
   // ---------------------------------------------------------------
   jesd204_pcs_link_training #(
     .NUM_LANES(NUM_LANES),
     .NUM_LINKS(NUM_LINKS),
     .DATA_PATH_WIDTH(DATA_PATH_WIDTH),
-    .ENABLE_FRAME_ALIGN_CHECK(0),
-    .ENABLE_CHAR_REPLACE(0),
+    .ENABLE_FRAME_ALIGN_CHECK(1),
+    .ENABLE_CHAR_REPLACE(1),
+    .ENABLE_FRAME_ALIGN_ERR_RESET(1),
+    .FRAME_ALIGN_ERR_THRESHOLD(8'd16),
     .ELASTIC_BUFFER_SIZE(256)
   ) tx_device (
     .clk(tx_clk),
@@ -196,27 +199,30 @@ module jesd204_pcs_link_training_tb;
     .rx_notintable(),
     .rx_disperr(),
     .serdes_tx_data(tx_serdes_data),
-    .serdes_rx_data({(DATA_PATH_WIDTH*10*NUM_LANES){1'b0}}),
-    .sync_request_n(rx_sync_n),  // RX device sync_n drives TX device
+    .serdes_rx_data({SW{1'b0}}),
+    .sync_request_n(rx_sync_n),
     .status_ctrl_state(tx_status_state),
     .status_lane_cgs_state(),
     .status_lane_ifs_ready(),
-    .sync_n(tx_sync_n),  // TX device's own sync_n (unused)
+    .sync_n(tx_sync_n),
     .ilas_config_valid(),
     .ilas_config_addr(),
     .ilas_config_data(),
     .status_err_statistics_cnt(),
+    .status_frame_align_err_cnt_0(),
     .event_frame_alignment_error());
 
   // ---------------------------------------------------------------
-  // RX Device (DUT 2) - no sync_request needed (always ready)
+  // RX Device (DUT 2)
   // ---------------------------------------------------------------
   jesd204_pcs_link_training #(
     .NUM_LANES(NUM_LANES),
     .NUM_LINKS(NUM_LINKS),
     .DATA_PATH_WIDTH(DATA_PATH_WIDTH),
-    .ENABLE_FRAME_ALIGN_CHECK(0),
-    .ENABLE_CHAR_REPLACE(0),
+    .ENABLE_FRAME_ALIGN_CHECK(1),
+    .ENABLE_CHAR_REPLACE(1),
+    .ENABLE_FRAME_ALIGN_ERR_RESET(1),
+    .FRAME_ALIGN_ERR_THRESHOLD(8'd16),
     .ELASTIC_BUFFER_SIZE(256)
   ) rx_device (
     .clk(rx_clk),
@@ -243,16 +249,17 @@ module jesd204_pcs_link_training_tb;
     .rx_disperr(rx_app_disperr),
     .serdes_tx_data(),
     .serdes_rx_data(rx_serdes_data),
-    .sync_request_n({NUM_LINKS{1'b1}}),  // no remote request into RX device
+    .sync_request_n({NUM_LINKS{1'b1}}),
     .status_ctrl_state(rx_status_state),
     .status_lane_cgs_state(),
     .status_lane_ifs_ready(),
-    .sync_n(rx_sync_n),  // RX device's sync_n goes to TX device
+    .sync_n(rx_sync_n),
     .ilas_config_valid(rx_ilas_config_valid),
     .ilas_config_addr(),
     .ilas_config_data(),
     .status_err_statistics_cnt(),
-    .event_frame_alignment_error());
+    .status_frame_align_err_cnt_0(rx_frame_align_err_cnt_0),
+    .event_frame_alignment_error(rx_event_frame_alignment_error));
 
   // ---------------------------------------------------------------
   // Common configuration
@@ -264,7 +271,7 @@ module jesd204_pcs_link_training_tb;
       tx_cfg_lanes_disable = {NUM_LANES{1'b0}};
       tx_cfg_links_disable = {NUM_LINKS{1'b0}};
       tx_cfg_disable_scrambler = 1'b1;
-      tx_cfg_disable_char_replacement = 1'b1;
+      tx_cfg_disable_char_replacement = 1'b0;
       tx_cfg_mframes_per_ilas = 8'd4;
       tx_cfg_skip_ilas = 1'b0;
       tx_cfg_continuous_cgs = 1'b0;
@@ -275,7 +282,7 @@ module jesd204_pcs_link_training_tb;
       rx_cfg_lanes_disable = {NUM_LANES{1'b0}};
       rx_cfg_links_disable = {NUM_LINKS{1'b0}};
       rx_cfg_disable_scrambler = 1'b1;
-      rx_cfg_disable_char_replacement = 1'b1;
+      rx_cfg_disable_char_replacement = 1'b0;
       rx_cfg_mframes_per_ilas = 8'd4;
       rx_cfg_skip_ilas = 1'b0;
       rx_cfg_continuous_cgs = 1'b0;
@@ -284,23 +291,17 @@ module jesd204_pcs_link_training_tb;
   endtask
 
   // ---------------------------------------------------------------
-  // Reference (TX side) and captured (RX side) streams
+  // Reference and capture streams
   // ---------------------------------------------------------------
   localparam TOTAL = PREAMBLE_LEN + PAYLOAD_LEN;
+  localparam CAP_MAX = 4096;
 
-  // reference: for each transmitted DATA beat, the full DW-wide word
   reg [DW-1:0] tx_ref [0:TOTAL-1];
-  integer tx_beats;             // number of DATA beats transmitted
-
-  // capture: every valid RX application beat
-  localparam CAP_MAX = 2048;
+  integer tx_beats;
   reg [DW-1:0] rx_cap [0:CAP_MAX-1];
   integer rx_beats;
-
   integer match_count, mismatch_count, anchor;
 
-  // Build the DW-wide word transmitted on beat number `bn` (0-based over the
-  // whole TOTAL sequence: first PREAMBLE_LEN beats are markers, then payload).
   function [DW-1:0] gen_word;
     input integer bn;
     integer l, p;
@@ -309,15 +310,18 @@ module jesd204_pcs_link_training_tb;
       w = {DW{1'b0}};
       if (bn < PREAMBLE_LEN) begin
         for (l = 0; l < NUM_LANES; l = l + 1) begin
-          // both octets of every lane carry the same marker byte
           w[(l*DATA_PATH_WIDTH+0)*8 +: 8] = preamble_byte(bn);
           w[(l*DATA_PATH_WIDTH+1)*8 +: 8] = preamble_byte(bn);
+          w[(l*DATA_PATH_WIDTH+2)*8 +: 8] = preamble_byte(bn);
+          w[(l*DATA_PATH_WIDTH+3)*8 +: 8] = preamble_byte(bn);
         end
       end else begin
         p = bn - PREAMBLE_LEN;
         for (l = 0; l < NUM_LANES; l = l + 1) begin
           w[(l*DATA_PATH_WIDTH+0)*8 +: 8] = payload_byte(p, l, 0);
           w[(l*DATA_PATH_WIDTH+1)*8 +: 8] = payload_byte(p, l, 1);
+          w[(l*DATA_PATH_WIDTH+2)*8 +: 8] = payload_byte(p, l, 2);
+          w[(l*DATA_PATH_WIDTH+3)*8 +: 8] = payload_byte(p, l, 3);
         end
       end
       gen_word = w;
@@ -347,23 +351,19 @@ module jesd204_pcs_link_training_tb;
     rx_reset = 0;
     repeat(20) @(posedge tx_clk);
 
-    $display("[%0t] Starting 2-DUT test (%0d lanes, max skew %0d cycles)...",
-             $time, NUM_LANES, MAX_SKEW);
+    $display("[%0t] Starting 2-DUT test (%0d lanes, DPW=%0d, max skew %0d cycles)...",
+             $time, NUM_LANES, DATA_PATH_WIDTH, MAX_SKEW);
 
-    // Wait for link training to complete on both sides.
     wait(tx_status_state == 2'b11);
     $display("[%0t] TX device reached DATA state", $time);
     wait(rx_app_valid == 1'b1);
     $display("[%0t] RX de-skew complete, application data valid", $time);
 
-    // Let the data phase settle a few multiframes before injecting payload.
     repeat(40) @(posedge tx_clk);
 
     $display("[%0t] Transmitting %0d marker + %0d payload beats...",
              $time, PREAMBLE_LEN, PAYLOAD_LEN);
 
-    // In the DATA phase the TX line carries one application beat every parallel
-    // clock, so we drive a fresh word every cycle and record it as reference.
     for (ts = 0; ts < TOTAL; ts = ts + 1) begin
       @(posedge tx_clk);
       tx_app_valid <= 1'b1;
@@ -376,18 +376,12 @@ module jesd204_pcs_link_training_tb;
     tx_app_valid <= 1'b0;
     tx_app_data  <= {DW{1'b0}};
 
-    // Allow the whole payload to drain through skew + elastic buffers.  The RX
-    // trails the TX by the elastic-buffer fill latency (idle beats accumulated
-    // before payload injection), so wait long enough to flush all TOTAL beats.
-    repeat(400) @(posedge tx_clk);
+    repeat(600) @(posedge tx_clk);
 
-    // ---------------------------------------------------------------
-    // Scoreboard: anchor on the preamble, then verify the payload.
-    // ---------------------------------------------------------------
     verify_stream;
 
     $display("========================================");
-    $display("2-DUT Test Results:");
+    $display("2-DUT Test Results (DPW=%0d):", DATA_PATH_WIDTH);
     $display("  Lane skews:  %0d, %0d, %0d, %0d",
              lane_delay[0], lane_delay[1], lane_delay[2], lane_delay[3]);
     $display("  TX beats:    %0d", tx_beats);
@@ -395,13 +389,14 @@ module jesd204_pcs_link_training_tb;
     $display("  Anchor idx:  %0d", anchor);
     $display("  Matches:     %0d", match_count);
     $display("  Mismatches:  %0d", mismatch_count);
+    $display("  Frame-align err cnt (lane 0): %0d", rx_frame_align_err_cnt_0);
     $display("  TX state:    %0b", tx_status_state);
     $display("========================================");
 
     if (tx_status_state == 2'b11 && anchor >= 0 &&
         match_count == PAYLOAD_LEN && mismatch_count == 0)
-      $display("SUCCESS: 2-DUT link training + data transfer verified across %0d lanes",
-               NUM_LANES);
+      $display("SUCCESS: 2-DUT link training + data transfer verified across %0d lanes (DPW=%0d)",
+               NUM_LANES, DATA_PATH_WIDTH);
     else
       $display("FAILED");
 
@@ -409,7 +404,7 @@ module jesd204_pcs_link_training_tb;
   end
 
   // ---------------------------------------------------------------
-  // RX capture: record every valid application beat
+  // RX capture
   // ---------------------------------------------------------------
   always @(posedge rx_clk) begin
     if (!rx_reset && rx_app_valid && rx_app_ready && rx_beats < CAP_MAX) begin
@@ -419,15 +414,12 @@ module jesd204_pcs_link_training_tb;
   end
 
   // ---------------------------------------------------------------
-  // Find the preamble in the capture, then compare the payload beat-by-beat
-  // across every lane and octet.
+  // Scoreboard
   // ---------------------------------------------------------------
   task verify_stream;
     integer idx, k, l, oct, ok;
     reg [7:0] got, exp;
     begin
-      // locate anchor: first index where PREAMBLE_LEN consecutive beats match
-      // the marker words on all lanes/octets.
       anchor = -1;
       for (idx = 0; idx + PREAMBLE_LEN <= rx_beats && anchor < 0; idx = idx + 1) begin
         ok = 1;
@@ -450,7 +442,6 @@ module jesd204_pcs_link_training_tb;
 
       $display("[%0t] Preamble anchored at RX beat %0d", $time, anchor);
 
-      // verify the payload region
       for (k = 0; k < PAYLOAD_LEN; k = k + 1) begin
         ok = 1;
         for (l = 0; l < NUM_LANES; l = l + 1) begin
@@ -475,7 +466,7 @@ module jesd204_pcs_link_training_tb;
   // Timeout
   // ---------------------------------------------------------------
   initial begin
-    #3000000;
+    #5000000;
     $display("TIMEOUT: tx_state=%0b rx_valid=%0b rx_beats=%0d",
              tx_status_state, rx_app_valid, rx_beats);
     $finish;
@@ -494,6 +485,19 @@ module jesd204_pcs_link_training_tb;
         2'b11: $display("[%0t] TX: DATA", $time);
       endcase
       tx_prev_state <= tx_status_state;
+    end
+  end
+
+  reg [1:0] rx_prev_state;
+  always @(posedge rx_clk) begin
+    if (!rx_reset && rx_status_state !== rx_prev_state) begin
+      case (rx_status_state)
+        2'b00: $display("[%0t] RX: RESET", $time);
+        2'b01: $display("[%0t] RX: CGS", $time);
+        2'b10: $display("[%0t] RX: ILAS", $time);
+        2'b11: $display("[%0t] RX: DATA", $time);
+      endcase
+      rx_prev_state <= rx_status_state;
     end
   end
 

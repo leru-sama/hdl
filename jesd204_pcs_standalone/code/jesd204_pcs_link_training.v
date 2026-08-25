@@ -1,5 +1,5 @@
 // ***************************************************************************
-// JESD204 PCS with Link Training
+// JESD204 PCS with Link Training and Frame-Align Error Detection
 // Complete PCS with CGS, ILAS, and data phase support
 // ***************************************************************************
 // Copyright (C) 2024 Analog Devices, Inc. All rights reserved.
@@ -11,16 +11,16 @@
 module jesd204_pcs_link_training #(
   parameter NUM_LANES = 1,
   parameter NUM_LINKS = 1,
-  parameter DATA_PATH_WIDTH = 2,  // 2 for 20-bit serdes
+  parameter DATA_PATH_WIDTH = 4,  // 4 for 40-bit serdes
   parameter ENABLE_FRAME_ALIGN_CHECK = 1,
   parameter ENABLE_CHAR_REPLACE = 1,
+  parameter ENABLE_FRAME_ALIGN_ERR_RESET = 1,
+  parameter FRAME_ALIGN_ERR_THRESHOLD = 8'd16,
   parameter ELASTIC_BUFFER_SIZE = 256
 ) (
-  // Clock and reset
   input clk,
   input reset,
 
-  // Configuration
   input [9:0] cfg_octets_per_multiframe,
   input [7:0] cfg_octets_per_frame,
   input [NUM_LANES-1:0] cfg_lanes_disable,
@@ -32,13 +32,11 @@ module jesd204_pcs_link_training #(
   input cfg_continuous_cgs,
   input cfg_continuous_ilas,
 
-  // TX Application Interface (ready/valid handshake)
   input tx_valid,
   output tx_ready,
   input [DATA_PATH_WIDTH*8*NUM_LANES-1:0] tx_data,
   input [DATA_PATH_WIDTH*NUM_LANES-1:0] tx_charisk,
 
-  // RX Application Interface (ready/valid handshake)
   output rx_valid,
   input rx_ready,
   output [DATA_PATH_WIDTH*8*NUM_LANES-1:0] rx_data,
@@ -46,32 +44,26 @@ module jesd204_pcs_link_training #(
   output [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_notintable,
   output [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_disperr,
 
-  // Serdes Interface
   output [DATA_PATH_WIDTH*10*NUM_LANES-1:0] serdes_tx_data,
   input [DATA_PATH_WIDTH*10*NUM_LANES-1:0] serdes_rx_data,
 
-  // Link Control/Status
-  input [NUM_LINKS-1:0] sync_request_n,   // From remote RX: LOW = request CGS
-  output [1:0] status_ctrl_state,         // 00=RESET, 01=CGS, 10=ILAS, 11=DATA
+  input [NUM_LINKS-1:0] sync_request_n,
+  output [1:0] status_ctrl_state,
   output [2*NUM_LANES-1:0] status_lane_cgs_state,
   output [NUM_LANES-1:0] status_lane_ifs_ready,
-  output [NUM_LINKS-1:0] sync_n,          // To remote TX: LOW = requesting CGS
+  output [NUM_LINKS-1:0] sync_n,
 
-  // ILAS Config from RX
   output [NUM_LANES-1:0] ilas_config_valid,
   output [NUM_LANES*2-1:0] ilas_config_addr,
   output [NUM_LANES*DATA_PATH_WIDTH*8-1:0] ilas_config_data,
 
-  // Error Status
   output [32*NUM_LANES-1:0] status_err_statistics_cnt,
+  output [NUM_LANES-1:0] status_frame_align_err_cnt_0,
   output event_frame_alignment_error
 );
 
-  // ---------------------------------------------------------------
-  // Internal signals
-  // ---------------------------------------------------------------
+  localparam DPW_LOG2 = DATA_PATH_WIDTH == 8 ? 3 : DATA_PATH_WIDTH == 4 ? 2 : 1;
 
-  // TX internal
   wire [DATA_PATH_WIDTH*8*NUM_LANES-1:0] tx_phy_data;
   wire [DATA_PATH_WIDTH*NUM_LANES-1:0] tx_phy_charisk;
   wire [NUM_LANES-1:0] lane_cgs_enable;
@@ -85,7 +77,6 @@ module jesd204_pcs_link_training #(
   wire tx_ready_nx;
   wire tx_next_mf_ready;
 
-  // RX internal
   wire [DATA_PATH_WIDTH*8*NUM_LANES-1:0] rx_phy_data;
   wire [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_phy_charisk;
   wire [DATA_PATH_WIDTH*NUM_LANES-1:0] rx_phy_notintable;
@@ -99,25 +90,27 @@ module jesd204_pcs_link_training #(
   wire event_data_phase;
   wire lmfc_edge;
 
-  // Frame marking
   wire [DATA_PATH_WIDTH-1:0] sof, eof, somf, eomf;
 
-  // ---------------------------------------------------------------
-  // LMFC (Local Multi-Frame Clock)
-  // ---------------------------------------------------------------
+  reg  [NUM_LANES-1:0] frame_align_err_thresh_met;
+  wire [7:0] frame_align_err_cnt_w [0:NUM_LANES-1];
+  reg  [7:0] frame_align_err_cnt   [0:NUM_LANES-1];
 
+  // ---------------------------------------------------------------
+  // LMFC
+  // ---------------------------------------------------------------
   jesd204_lmfc #(
     .LINK_MODE(1),
     .DATA_PATH_WIDTH(DATA_PATH_WIDTH)
   ) i_lmfc (
     .clk(clk),
     .reset(reset),
-    .sysref(1'b0),  // No SYSREF in this simplified version
+    .sysref(1'b0),
     .cfg_octets_per_multiframe(cfg_octets_per_multiframe),
-    .cfg_beats_per_multiframe(cfg_octets_per_multiframe[9:1]),  // DPW_LOG2=1 for DPW=2
+    .cfg_beats_per_multiframe(cfg_octets_per_multiframe[9:DPW_LOG2]),
     .cfg_lmfc_offset(8'd0),
     .cfg_sysref_oneshot(1'b0),
-    .cfg_sysref_disable(1'b1),  // Disable SYSREF, free-running
+    .cfg_sysref_disable(1'b1),
     .lmfc_edge(lmfc_edge),
     .lmfc_clk(),
     .lmfc_counter(),
@@ -130,14 +123,13 @@ module jesd204_pcs_link_training #(
   // ---------------------------------------------------------------
   // Frame Marking
   // ---------------------------------------------------------------
-
   jesd204_frame_mark #(
     .DATA_PATH_WIDTH(DATA_PATH_WIDTH)
   ) i_frame_mark (
     .clk(clk),
     .reset(eof_reset),
     .cfg_octets_per_multiframe(cfg_octets_per_multiframe),
-    .cfg_beats_per_multiframe(cfg_octets_per_multiframe[9:1]),
+    .cfg_beats_per_multiframe(cfg_octets_per_multiframe[9:DPW_LOG2]),
     .cfg_octets_per_frame(cfg_octets_per_frame),
     .sof(sof),
     .eof(eof),
@@ -147,7 +139,6 @@ module jesd204_pcs_link_training #(
   // ---------------------------------------------------------------
   // TX Control State Machine
   // ---------------------------------------------------------------
-
   jesd204_tx_ctrl #(
     .NUM_LANES(NUM_LANES),
     .NUM_LINKS(NUM_LINKS),
@@ -155,10 +146,10 @@ module jesd204_pcs_link_training #(
   ) i_tx_ctrl (
     .clk(clk),
     .reset(reset),
-    .sync(sync_request_n),  // From remote RX: LOW = request CGS
+    .sync(sync_request_n),
     .lmfc_edge(lmfc_edge),
     .somf(somf),
-    .somf_early2(somf),  // Simplified
+    .somf_early2(somf),
     .eomf(eomf),
     .lane_cgs_enable(lane_cgs_enable),
     .eof_reset(eof_reset),
@@ -181,13 +172,11 @@ module jesd204_pcs_link_training #(
     .status_sync(),
     .status_state(status_ctrl_state));
 
-  // TX ready to application
   assign tx_ready = tx_ctrl_ready;
 
   // ---------------------------------------------------------------
-  // TX Lane (per lane)
+  // TX Lane
   // ---------------------------------------------------------------
-
   genvar i;
   generate
     for (i = 0; i < NUM_LANES; i = i + 1) begin : gen_tx_lane
@@ -217,9 +206,8 @@ module jesd204_pcs_link_training #(
   endgenerate
 
   // ---------------------------------------------------------------
-  // 8b10b Encoder (TX) - per character, with disparity tracking
+  // 8b10b Encoder (TX)
   // ---------------------------------------------------------------
-
   generate
     for (i = 0; i < NUM_LANES; i = i + 1) begin : gen_tx_encoder
       wire [DATA_PATH_WIDTH:0] disparity_chain;
@@ -253,9 +241,8 @@ module jesd204_pcs_link_training #(
   endgenerate
 
   // ---------------------------------------------------------------
-  // 8b10b Decoder (RX) - per character, with disparity tracking
+  // 8b10b Decoder (RX)
   // ---------------------------------------------------------------
-
   generate
     for (i = 0; i < NUM_LANES; i = i + 1) begin : gen_rx_decoder
       wire [DATA_PATH_WIDTH:0] disparity_chain_rx;
@@ -291,13 +278,48 @@ module jesd204_pcs_link_training #(
   endgenerate
 
   // ---------------------------------------------------------------
+  // Frame-align error capture (from rx_lane outputs)
+  // ---------------------------------------------------------------
+  generate
+    for (i = 0; i < NUM_LANES; i = i + 1) begin : gen_cap_err_cnt
+      always @(posedge clk) begin
+        if (reset)
+          frame_align_err_cnt[i] <= 8'd0;
+        else
+          frame_align_err_cnt[i] <= frame_align_err_cnt_w[i];
+      end
+    end
+  endgenerate
+
+  // ---------------------------------------------------------------
+  // Frame-align error threshold monitoring
+  // ---------------------------------------------------------------
+  generate
+    for (i = 0; i < NUM_LANES; i = i + 1) begin : gen_frame_align_mon
+      always @(posedge clk) begin
+        if (reset) begin
+          frame_align_err_thresh_met[i] <= 1'b0;
+        end else if (ENABLE_FRAME_ALIGN_ERR_RESET) begin
+          if (frame_align_err_cnt[i] >= FRAME_ALIGN_ERR_THRESHOLD)
+            frame_align_err_thresh_met[i] <= 1'b1;
+          else if (cgs_ready[i])
+            frame_align_err_thresh_met[i] <= 1'b0;
+        end else begin
+          frame_align_err_thresh_met[i] <= 1'b0;
+        end
+      end
+    end
+  endgenerate
+
+  assign event_frame_alignment_error = |frame_align_err_thresh_met;
+
+  // ---------------------------------------------------------------
   // RX Control State Machine
   // ---------------------------------------------------------------
-
   jesd204_rx_ctrl #(
     .NUM_LANES(NUM_LANES),
     .NUM_LINKS(NUM_LINKS),
-    .ENABLE_FRAME_ALIGN_ERR_RESET(0)
+    .ENABLE_FRAME_ALIGN_ERR_RESET(ENABLE_FRAME_ALIGN_ERR_RESET)
   ) i_rx_ctrl (
     .clk(clk),
     .reset(reset),
@@ -309,13 +331,12 @@ module jesd204_pcs_link_training #(
     .cgs_ready(cgs_ready),
     .ifs_reset(ifs_reset),
     .lmfc_edge(lmfc_edge),
-    .frame_align_err_thresh_met({NUM_LANES{1'b0}}),
+    .frame_align_err_thresh_met(frame_align_err_thresh_met),
     .sync(sync_n_int),
     .latency_monitor_reset(latency_monitor_reset),
     .status_state(),
     .event_data_phase(event_data_phase));
 
-  // Register sync_n output for clean CDC
   reg sync_n_reg = 1'b1;
   always @(posedge clk) begin
     sync_n_reg <= sync_n_int;
@@ -323,16 +344,14 @@ module jesd204_pcs_link_training #(
   assign sync_n = sync_n_reg;
 
   // ---------------------------------------------------------------
-  // RX Lane (per lane)
+  // RX Lane
   // ---------------------------------------------------------------
-
   wire [NUM_LANES-1:0] buffer_ready_n;
   wire all_buffer_ready_n;
   reg buffer_release_n = 1'b1;
   reg buffer_release_opportunity = 1'b0;
   reg [7:0] lmfc_counter_reg = 8'd0;
 
-  // Track LMFC counter for buffer release timing
   always @(posedge clk) begin
     if (reset) begin
       lmfc_counter_reg <= 8'd0;
@@ -343,26 +362,23 @@ module jesd204_pcs_link_training #(
     end
   end
 
-  // Buffer release opportunity at LMFC boundary (with configurable delay)
   always @(posedge clk) begin
-    if (lmfc_counter_reg == 8'd2) begin  // Small delay after LMFC edge
+    if (lmfc_counter_reg == 8'd2) begin
       buffer_release_opportunity <= 1'b1;
     end else begin
       buffer_release_opportunity <= 1'b0;
     end
   end
 
-  // All lanes ready when no lane has buffer_ready_n asserted
   assign all_buffer_ready_n = |buffer_ready_n;
 
-  // Release buffers when all lanes are ready, with delay for data accumulation
   reg [3:0] release_delay = 0;
   always @(posedge clk) begin
     if (reset) begin
       buffer_release_n <= 1'b1;
       release_delay <= 0;
     end else if (!all_buffer_ready_n && buffer_release_opportunity) begin
-      if (release_delay == 4'd8) begin  // Wait 8 cycles for data to accumulate
+      if (release_delay == 4'd8) begin
         buffer_release_n <= 1'b0;
       end else begin
         release_delay <= release_delay + 1'b1;
@@ -417,17 +433,15 @@ module jesd204_pcs_link_training #(
         .status_cgs_state(status_lane_cgs_state[2*i+1:2*i]),
         .status_ifs_ready(status_lane_ifs_ready[i]),
         .status_frame_align(),
-        .status_frame_align_err_cnt());
+        .status_frame_align_err_cnt(frame_align_err_cnt_w[i]));
     end
   endgenerate
 
-  // RX valid - after buffer release
+  assign status_frame_align_err_cnt_0 = frame_align_err_cnt[0];
+
   assign rx_valid = ~buffer_release_n;
   assign rx_charisk = rx_phy_charisk;
   assign rx_notintable = rx_phy_notintable;
   assign rx_disperr = rx_phy_disperr;
-
-  // Frame alignment error (simplified)
-  assign event_frame_alignment_error = 1'b0;
 
 endmodule

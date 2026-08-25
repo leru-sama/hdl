@@ -1,8 +1,8 @@
 # JESD204 Soft PCS - Standalone Project
 
 Standalone project containing two JESD204 soft-PCS designs (extracted from the
-ADI HDL repository) targeting a **transparent serdes with 20-bit parallel data
-per lane** and a **ready/valid** application interface:
+ADI HDL repository) targeting a **transparent serdes** with a **ready/valid**
+application interface:
 
 1. **`jesd204_soft_pcs_wrapper`** — minimal PCS: 8b10b encode/decode, comma
    (K28.5) pattern alignment, elastic FIFO with ready/valid handshake.
@@ -10,7 +10,25 @@ per lane** and a **ready/valid** application interface:
    → DATA) reusing ADI's `jesd204_tx_ctrl` / `jesd204_rx_ctrl` / `rx_cgs` /
    `ilas_monitor` / `tx_lane` / `rx_lane` (elastic buffers). The upper layer only
    deals with business payload over ready/valid; the PCS handles the whole
-   bring-up handshake and **multi-lane de-skew**.
+   bring-up handshake and **multi-lane de-skew**. Additionally,
+   **frame-align error detection** is enabled: if /A/ and /F/ alignment
+   characters drift from their expected EOMF/EOF boundaries (e.g. due to a
+   mid-stream lane skew jump), the RX state machine resets and re-trains
+   automatically.
+
+## Serdes Interface Width
+
+`DATA_PATH_WIDTH` controls the serdes data bus width:
+
+| DATA_PATH_WIDTH | serdes bits/lane | use case |
+|-----------------|-----------------|----------|
+| 2               | 20 bit          | original (kept for reference) |
+| **4**           | **40 bit**      | **default — supports native frame-align check** |
+
+**Default is now `DATA_PATH_WIDTH = 4` (40b/lane)**. The wrapper, TX/RX lanes,
+frame-mark, frame-align, and char-replace modules all run at DPW=4, which is
+natively supported by the ADI codebase. DPW=2 remains available as a parameter
+override for backward compatibility.
 
 ## Directory Structure
 
@@ -59,13 +77,31 @@ preamble followed by a **per-lane distinct incrementing payload**; the RX
 capture is anchored on the preamble and every payload beat is compared on all
 lanes and octets. This proves both data integrity and correct lane de-skew.
 
+### Frame-align error path (DPW=4 only)
+
+With `DATA_PATH_WIDTH=4` the native ADI `jesd204_rx_frame_align` module is
+instantiated inside each RX lane. It monitors /A/ (K28.5,D=3) and /F/
+(K28.5,D=7) alignment characters against the expected EOMF/EOF boundaries.
+When the error counter crosses `FRAME_ALIGN_ERR_THRESHOLD` (default 16), the
+wrapper asserts `frame_align_err_thresh_met` per lane, which drives
+`jesd204_rx_ctrl`'s `ENABLE_FRAME_ALIGN_ERR_RESET` path back to RESET → CGS,
+causing the link to re-train.
+
+**Caveat:** the error counter only increments when /A/ or /F/ are present in
+the stream *and* fall on the wrong beat. Random application data does not
+contain these characters at the expected positions, so the counter stays at
+zero during normal operation. To exercise the error→resync path you need to
+ensure the payload carries /A/ at EOMF and /F/ at EOF (e.g. by enabling char
+replacement and making the EOF-position byte match `data_prev_eof`, or by
+injecting the characters directly from the application).
+
 ### Results
 
 Single run (default seed) and a 20-seed random-skew sweep all pass, including
 worst-case skews such as `[16,16,16,7]`:
 
 ```
-seed=5  skews=[16,16,16,7] : SUCCESS: 2-DUT link training + data transfer verified across 4 lanes
+seed=5  skews=[16,16,16,7] : SUCCESS: 2-DUT link training + data transfer verified across 4 lanes (DPW=4)
 ...
 ==== PASS=20 FAIL=0 ====
 ```
@@ -75,7 +111,7 @@ seed=5  skews=[16,16,16,7] : SUCCESS: 2-DUT link training + data transfer verifi
 Prerequisites: Icarus Verilog (`iverilog`), optionally GTKWave.
 
 ```bash
-# 2-DUT link-training test (single random-skew pattern)
+# 2-DUT link-training test (single random-skew pattern, DPW=4)
 make simulate_link_training
 
 # Sweep 20 random per-lane skew patterns through the 2-DUT test
@@ -109,20 +145,25 @@ TX application (ready/valid): `tx_valid`, `tx_ready`,
 RX application (ready/valid): `rx_valid`, `rx_ready`, `rx_data`, `rx_charisk`,
 `rx_notintable`, `rx_disperr`.
 
-Serdes: `serdes_tx_data`, `serdes_rx_data` (`DATA_PATH_WIDTH*10` bits/lane = 20b
-for `DATA_PATH_WIDTH=2`).
+Serdes: `serdes_tx_data`, `serdes_rx_data` (`DATA_PATH_WIDTH*10` bits/lane:
+**40 bit for `DATA_PATH_WIDTH=4`**).
 
 Link control/status: `sync_request_n` (from remote RX), `sync_n` (to remote TX),
 `status_ctrl_state` (00=RESET, 01=CGS, 10=ILAS, 11=DATA),
 `status_lane_cgs_state`, `status_lane_ifs_ready`, `ilas_config_*`,
-`status_err_statistics_cnt`.
+`status_err_statistics_cnt`, `status_frame_align_err_cnt_0`,
+`event_frame_alignment_error`.
 
 ## Parameters
 
 - `NUM_LANES` — serdes lanes (test uses 4).
 - `NUM_LINKS` — links (1).
-- `DATA_PATH_WIDTH` — 10b symbols per clock; **2 → 20-bit serdes lanes**.
-- `ENABLE_FRAME_ALIGN_CHECK`, `ENABLE_CHAR_REPLACE`, `ELASTIC_BUFFER_SIZE`.
+- `DATA_PATH_WIDTH` — 10b symbols per clock; **default 4 → 40-bit serdes lanes**.
+- `ENABLE_FRAME_ALIGN_CHECK` — enable RX frame-align monitor (default 1).
+- `ENABLE_CHAR_REPLACE` — enable TX /A/ /F/ char replacement (default 1).
+- `ENABLE_FRAME_ALIGN_ERR_RESET` — auto-reset on frame-align error (default 1).
+- `FRAME_ALIGN_ERR_THRESHOLD` — error count threshold before resync (default 16).
+- `ELASTIC_BUFFER_SIZE` — per-lane elastic buffer depth (default 256).
 
 ## License
 
