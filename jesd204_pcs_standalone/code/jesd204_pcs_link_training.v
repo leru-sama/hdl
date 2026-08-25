@@ -50,11 +50,12 @@ module jesd204_pcs_link_training #(
   output [DATA_PATH_WIDTH*10*NUM_LANES-1:0] serdes_tx_data,
   input [DATA_PATH_WIDTH*10*NUM_LANES-1:0] serdes_rx_data,
 
-  // Link Status
-  output [1:0] status_ctrl_state,      // 00=RESET, 01=CGS, 10=ILAS, 11=DATA
+  // Link Control/Status
+  input [NUM_LINKS-1:0] sync_request_n,   // From remote RX: LOW = request CGS
+  output [1:0] status_ctrl_state,         // 00=RESET, 01=CGS, 10=ILAS, 11=DATA
   output [2*NUM_LANES-1:0] status_lane_cgs_state,
   output [NUM_LANES-1:0] status_lane_ifs_ready,
-  output [NUM_LINKS-1:0] sync_n,       // SYNC request from RX (active low)
+  output [NUM_LINKS-1:0] sync_n,          // To remote TX: LOW = requesting CGS
 
   // ILAS Config from RX
   output [NUM_LANES-1:0] ilas_config_valid,
@@ -154,7 +155,7 @@ module jesd204_pcs_link_training #(
   ) i_tx_ctrl (
     .clk(clk),
     .reset(reset),
-    .sync(sync_n_int),  // Active low: sync_n LOW = request CGS
+    .sync(sync_request_n),  // From remote RX: LOW = request CGS
     .lmfc_edge(lmfc_edge),
     .somf(somf),
     .somf_early2(somf),  // Simplified
@@ -314,7 +315,12 @@ module jesd204_pcs_link_training #(
     .status_state(),
     .event_data_phase(event_data_phase));
 
-  assign sync_n = sync_n_int;
+  // Register sync_n output for clean CDC
+  reg sync_n_reg = 1'b1;
+  always @(posedge clk) begin
+    sync_n_reg <= sync_n_int;
+  end
+  assign sync_n = sync_n_reg;
 
   // ---------------------------------------------------------------
   // RX Lane (per lane)
@@ -349,12 +355,20 @@ module jesd204_pcs_link_training #(
   // All lanes ready when no lane has buffer_ready_n asserted
   assign all_buffer_ready_n = |buffer_ready_n;
 
-  // Release buffers when all lanes are ready and at LMFC boundary
+  // Release buffers when all lanes are ready, with delay for data accumulation
+  reg [3:0] release_delay = 0;
   always @(posedge clk) begin
     if (reset) begin
       buffer_release_n <= 1'b1;
-    end else if (buffer_release_opportunity && !all_buffer_ready_n) begin
-      buffer_release_n <= 1'b0;  // Release
+      release_delay <= 0;
+    end else if (!all_buffer_ready_n && buffer_release_opportunity) begin
+      if (release_delay == 4'd8) begin  // Wait 8 cycles for data to accumulate
+        buffer_release_n <= 1'b0;
+      end else begin
+        release_delay <= release_delay + 1'b1;
+      end
+    end else if (all_buffer_ready_n) begin
+      release_delay <= 0;
     end
   end
 
