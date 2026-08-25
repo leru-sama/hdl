@@ -11,7 +11,7 @@
 module jesd204_pcs_link_training #(
   parameter NUM_LANES = 1,
   parameter NUM_LINKS = 1,
-  parameter DATA_PATH_WIDTH = 4,  // 4 for 40-bit serdes
+  parameter DATA_PATH_WIDTH = 8,  // 8 for 80-bit serdes (64B per lane per cycle at 4 lanes = 256B total)
   parameter ENABLE_FRAME_ALIGN_CHECK = 1,
   parameter ENABLE_CHAR_REPLACE = 1,
   parameter ENABLE_FRAME_ALIGN_ERR_RESET = 1,

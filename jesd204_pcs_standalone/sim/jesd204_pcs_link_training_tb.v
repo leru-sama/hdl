@@ -32,7 +32,7 @@ module jesd204_pcs_link_training_tb;
 
   parameter NUM_LANES = 4;
   parameter NUM_LINKS = 1;
-  parameter DATA_PATH_WIDTH = 4;
+  parameter DATA_PATH_WIDTH = 8;
   parameter CLK_PERIOD = 10;
   parameter MAX_SKEW = 16;
   parameter SEED = 1;
@@ -122,7 +122,7 @@ module jesd204_pcs_link_training_tb;
   // ---------------------------------------------------------------
   // Serdes model: per-lane random skew (0..MAX_SKEW parallel cycles)
   // ---------------------------------------------------------------
-  reg [39:0] lane_pipe [0:NUM_LANES-1][0:MAX_SKEW];
+  reg [79:0] lane_pipe [0:NUM_LANES-1][0:MAX_SKEW];
   integer lane_delay [0:NUM_LANES-1];
   integer i;
   integer sh_i, sh_s;
@@ -140,7 +140,7 @@ module jesd204_pcs_link_training_tb;
 
   always @(posedge rx_clk) begin
     for (sh_i = 0; sh_i < NUM_LANES; sh_i = sh_i + 1) begin
-      lane_pipe[sh_i][0] <= tx_serdes_data[sh_i*40 +: 40];
+      lane_pipe[sh_i][0] <= tx_serdes_data[sh_i*80 +: 80];
       for (sh_s = 1; sh_s <= MAX_SKEW; sh_s = sh_s + 1)
         lane_pipe[sh_i][sh_s] <= lane_pipe[sh_i][sh_s-1];
     end
@@ -148,7 +148,7 @@ module jesd204_pcs_link_training_tb;
 
   always @(*) begin
     for (cm_i = 0; cm_i < NUM_LANES; cm_i = cm_i + 1)
-      rx_serdes_data[cm_i*40 +: 40] = lane_pipe[cm_i][lane_delay[cm_i]];
+      rx_serdes_data[cm_i*80 +: 80] = lane_pipe[cm_i][lane_delay[cm_i]];
   end
 
   // ---------------------------------------------------------------
@@ -171,7 +171,7 @@ module jesd204_pcs_link_training_tb;
     .NUM_LINKS(NUM_LINKS),
     .DATA_PATH_WIDTH(DATA_PATH_WIDTH),
     .ENABLE_FRAME_ALIGN_CHECK(1),
-    .ENABLE_CHAR_REPLACE(1),
+    .ENABLE_CHAR_REPLACE(0),
     .ENABLE_FRAME_ALIGN_ERR_RESET(1),
     .FRAME_ALIGN_ERR_THRESHOLD(8'd16),
     .ELASTIC_BUFFER_SIZE(256)
@@ -220,7 +220,7 @@ module jesd204_pcs_link_training_tb;
     .NUM_LINKS(NUM_LINKS),
     .DATA_PATH_WIDTH(DATA_PATH_WIDTH),
     .ENABLE_FRAME_ALIGN_CHECK(1),
-    .ENABLE_CHAR_REPLACE(1),
+    .ENABLE_CHAR_REPLACE(0),
     .ENABLE_FRAME_ALIGN_ERR_RESET(1),
     .FRAME_ALIGN_ERR_THRESHOLD(8'd16),
     .ELASTIC_BUFFER_SIZE(256)
@@ -267,22 +267,22 @@ module jesd204_pcs_link_training_tb;
   task apply_cfg;
     begin
       tx_cfg_octets_per_multiframe = 10'd32;
-      tx_cfg_octets_per_frame = 8'd4;
+      tx_cfg_octets_per_frame = 8'd8;
       tx_cfg_lanes_disable = {NUM_LANES{1'b0}};
       tx_cfg_links_disable = {NUM_LINKS{1'b0}};
       tx_cfg_disable_scrambler = 1'b1;
-      tx_cfg_disable_char_replacement = 1'b0;
+      tx_cfg_disable_char_replacement = 1'b1;
       tx_cfg_mframes_per_ilas = 8'd4;
       tx_cfg_skip_ilas = 1'b0;
       tx_cfg_continuous_cgs = 1'b0;
       tx_cfg_continuous_ilas = 1'b0;
 
       rx_cfg_octets_per_multiframe = 10'd32;
-      rx_cfg_octets_per_frame = 8'd4;
+      rx_cfg_octets_per_frame = 8'd8;
       rx_cfg_lanes_disable = {NUM_LANES{1'b0}};
       rx_cfg_links_disable = {NUM_LINKS{1'b0}};
       rx_cfg_disable_scrambler = 1'b1;
-      rx_cfg_disable_char_replacement = 1'b0;
+      rx_cfg_disable_char_replacement = 1'b1;
       rx_cfg_mframes_per_ilas = 8'd4;
       rx_cfg_skip_ilas = 1'b0;
       rx_cfg_continuous_cgs = 1'b0;
@@ -310,18 +310,13 @@ module jesd204_pcs_link_training_tb;
       w = {DW{1'b0}};
       if (bn < PREAMBLE_LEN) begin
         for (l = 0; l < NUM_LANES; l = l + 1) begin
-          w[(l*DATA_PATH_WIDTH+0)*8 +: 8] = preamble_byte(bn);
-          w[(l*DATA_PATH_WIDTH+1)*8 +: 8] = preamble_byte(bn);
-          w[(l*DATA_PATH_WIDTH+2)*8 +: 8] = preamble_byte(bn);
-          w[(l*DATA_PATH_WIDTH+3)*8 +: 8] = preamble_byte(bn);
+          for (p = 0; p < DATA_PATH_WIDTH; p = p + 1)
+            w[(l*DATA_PATH_WIDTH+p)*8 +: 8] = preamble_byte(bn);
         end
       end else begin
-        p = bn - PREAMBLE_LEN;
         for (l = 0; l < NUM_LANES; l = l + 1) begin
-          w[(l*DATA_PATH_WIDTH+0)*8 +: 8] = payload_byte(p, l, 0);
-          w[(l*DATA_PATH_WIDTH+1)*8 +: 8] = payload_byte(p, l, 1);
-          w[(l*DATA_PATH_WIDTH+2)*8 +: 8] = payload_byte(p, l, 2);
-          w[(l*DATA_PATH_WIDTH+3)*8 +: 8] = payload_byte(p, l, 3);
+          for (p = 0; p < DATA_PATH_WIDTH; p = p + 1)
+            w[(l*DATA_PATH_WIDTH+p)*8 +: 8] = payload_byte(bn - PREAMBLE_LEN, l, p);
         end
       end
       gen_word = w;

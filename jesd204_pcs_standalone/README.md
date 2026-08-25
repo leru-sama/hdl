@@ -23,10 +23,10 @@ application interface:
 | DATA_PATH_WIDTH | serdes bits/lane | use case |
 |-----------------|-----------------|----------|
 | 2               | 20 bit          | original (kept for reference) |
-| **4**           | **40 bit**      | **default — supports native frame-align check** |
+| **8**           | **80 bit**      | **default — 64B per lane** |
 
-**Default is now `DATA_PATH_WIDTH = 4` (40b/lane)**. The wrapper, TX/RX lanes,
-frame-mark, frame-align, and char-replace modules all run at DPW=4, which is
+**Default is now `DATA_PATH_WIDTH = 8` (80b/lane)**. The wrapper, TX/RX lanes,
+frame-mark, frame-align, and char-replace modules all run at DPW=8, which is
 natively supported by the ADI codebase. DPW=2 remains available as a parameter
 override for backward compatibility.
 
@@ -77,9 +77,9 @@ preamble followed by a **per-lane distinct incrementing payload**; the RX
 capture is anchored on the preamble and every payload beat is compared on all
 lanes and octets. This proves both data integrity and correct lane de-skew.
 
-### Frame-align error path (DPW=4 only)
+### Frame-align error path (DPW=8)
 
-With `DATA_PATH_WIDTH=4` the native ADI `jesd204_rx_frame_align` module is
+With `DATA_PATH_WIDTH=8` the native ADI `jesd204_rx_frame_align` module is
 instantiated inside each RX lane. It monitors /A/ (K28.5,D=3) and /F/
 (K28.5,D=7) alignment characters against the expected EOMF/EOF boundaries.
 When the error counter crosses `FRAME_ALIGN_ERR_THRESHOLD` (default 16), the
@@ -101,7 +101,7 @@ Single run (default seed) and a 20-seed random-skew sweep all pass, including
 worst-case skews such as `[16,16,16,7]`:
 
 ```
-seed=5  skews=[16,16,16,7] : SUCCESS: 2-DUT link training + data transfer verified across 4 lanes (DPW=4)
+seed=5  skews=[16,16,16,7] : SUCCESS: 2-DUT link training + data transfer verified across 4 lanes (DPW=8)
 ...
 ==== PASS=20 FAIL=0 ====
 ```
@@ -111,7 +111,7 @@ seed=5  skews=[16,16,16,7] : SUCCESS: 2-DUT link training + data transfer verifi
 Prerequisites: Icarus Verilog (`iverilog`), optionally GTKWave.
 
 ```bash
-# 2-DUT link-training test (single random-skew pattern, DPW=4)
+# 2-DUT link-training test (single random-skew pattern, DPW=8)
 make simulate_link_training
 
 # Sweep 20 random per-lane skew patterns through the 2-DUT test
@@ -146,7 +146,7 @@ RX application (ready/valid): `rx_valid`, `rx_ready`, `rx_data`, `rx_charisk`,
 `rx_notintable`, `rx_disperr`.
 
 Serdes: `serdes_tx_data`, `serdes_rx_data` (`DATA_PATH_WIDTH*10` bits/lane:
-**40 bit for `DATA_PATH_WIDTH=4`**).
+**80 bit for `DATA_PATH_WIDTH=8`**).
 
 Link control/status: `sync_request_n` (from remote RX), `sync_n` (to remote TX),
 `status_ctrl_state` (00=RESET, 01=CGS, 10=ILAS, 11=DATA),
@@ -158,7 +158,7 @@ Link control/status: `sync_request_n` (from remote RX), `sync_n` (to remote TX),
 
 - `NUM_LANES` — serdes lanes (test uses 4).
 - `NUM_LINKS` — links (1).
-- `DATA_PATH_WIDTH` — 10b symbols per clock; **default 4 → 40-bit serdes lanes**.
+- `DATA_PATH_WIDTH` — 10b symbols per clock; **default 8 → 80-bit serdes lanes (64B per lane)**.
 - `ENABLE_FRAME_ALIGN_CHECK` — enable RX frame-align monitor (default 1).
 - `ENABLE_CHAR_REPLACE` — enable TX /A/ /F/ char replacement (default 1).
 - `ENABLE_FRAME_ALIGN_ERR_RESET` — auto-reset on frame-align error (default 1).
